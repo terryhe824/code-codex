@@ -897,7 +897,11 @@ fn validate_fields(params: &Value, action: &str) -> Result<()> {
     }
     Ok(())
 }
-fn open_authorization(value: &str) -> Result<()> {
+fn authorization_url(value: &str) -> Result<url::Url> {
+    #[cfg(target_os = "macos")]
+    if value.len() > 8192 || value.chars().any(char::is_control) || value.trim() != value {
+        return Err(AccountError::protocol("Invalid authorization URL."));
+    }
     let url =
         url::Url::parse(value).map_err(|_| AccountError::protocol("Invalid authorization URL."))?;
     if url.scheme() != "https"
@@ -909,6 +913,18 @@ fn open_authorization(value: &str) -> Result<()> {
             "An unexpected account authorization origin was rejected.",
         ));
     }
+    #[cfg(target_os = "macos")]
+    if url.port().is_some() {
+        return Err(AccountError::protocol(
+            "An unexpected account authorization origin was rejected.",
+        ));
+    }
+    Ok(url)
+}
+
+fn open_authorization(value: &str) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    authorization_url(value)?;
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -943,7 +959,20 @@ fn open_authorization(value: &str) -> Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let status = mac_authorization_command(value)?.status().map_err(|_| {
+            AccountError::new("ACCOUNT_BROWSER", "macOS could not dispatch the authorization page.")
+        })?;
+        if !status.success() {
+            return Err(AccountError::new(
+                "ACCOUNT_BROWSER",
+                "macOS could not open the official authorization page. Check the default HTTPS browser and retry.",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Err(AccountError::new(
             "ACCOUNT_UNSUPPORTED",
@@ -952,9 +981,39 @@ fn open_authorization(value: &str) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn mac_authorization_command(value: &str) -> Result<std::process::Command> {
+    let url = authorization_url(value)?;
+    let mut command = std::process::Command::new("/usr/bin/open");
+    command
+        .args(["-u", url.as_str()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    Ok(command)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_authorization_invokes_system_open_with_one_validated_url_argument() {
+        let value = "https://auth.openai.com/oauth/authorize?state=a%20b&prompt=login";
+        let command = mac_authorization_command(value).expect("official HTTPS URL");
+        assert_eq!(command.get_program(), "/usr/bin/open");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["-u", value]);
+        for rejected in [
+            "http://auth.openai.com/oauth/authorize",
+            "https://auth.openai.com.evil.invalid/oauth/authorize",
+            "https://user@auth.openai.com/oauth/authorize",
+            "https://auth.openai.com:8443/oauth/authorize",
+            "https://auth.openai.com/oauth/authorize\n",
+            "-a Calculator",
+        ] {
+            assert!(mac_authorization_command(rejected).is_err());
+        }
+    }
     #[test]
     fn requests_reject_commands_secrets_and_unexpected_fields() {
         for value in [
@@ -994,14 +1053,23 @@ fn lease(root: &Path) -> Result<std::fs::File> {
             "The account lease is redirected.",
         ));
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(0);
-    }
-    options.open(path).map_err(|error|{
+    #[cfg(target_os = "macos")]
+    let file = crate::startup_conflict::macos_user_lock(&path);
+    #[cfg(not(target_os = "macos"))]
+    let file = {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        options.open(path)
+    };
+    file.map_err(|error|{
+        #[cfg(target_os = "macos")]
+        let busy = error.kind() == std::io::ErrorKind::WouldBlock;
+        #[cfg(not(target_os = "macos"))]
         let busy=matches!(error.raw_os_error(),Some(32|33));
         let code=if busy{"ACCOUNT_OWNER_BUSY"}else{"ACCOUNT_LEASE_STORAGE"};
         crate::runtime_log::record("accounts","account.lease","blocked",json!({"stage":"exclusive-owner-lock","runtimePid":std::process::id(),"runtimeVersion":env!("CARGO_PKG_VERSION"),"osCode":error.raw_os_error(),"errorCode":code,"taskSent":false}));
@@ -1009,9 +1077,161 @@ fn lease(root: &Path) -> Result<std::fs::File> {
     })
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn purge_managed_credentials(data_root: &Path) -> std::io::Result<()> {
+    use std::{collections::BTreeSet, fs, io};
+    use std::os::unix::fs::MetadataExt as _;
+    use workspace_service::application_paths::validate_directory_path;
+    let accounts = data_root.join("accounts");
+    validate_directory_path(&accounts)?;
+    let owners = match fs::read_dir(&accounts) {
+        Ok(owners) => owners,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut owners_with_leases = Vec::new();
+    for owner in owners {
+        let owner = owner?;
+        let name = owner.file_name();
+        let metadata_limit = match name.to_str() {
+            Some("primary-switch.json") => Some(16 * 1024),
+            Some("retained-accounts.json") => Some(128 * 1024),
+            _ => None,
+        };
+        if let Some(limit) = metadata_limit {
+            let metadata = crate::renderer_storage::regular(&owner.path())?;
+            if metadata.nlink() != 1 || metadata.len() > limit {
+                return Err(io::Error::other("Invalid managed account metadata file"));
+            }
+            // Switch state never grants authority to delete a credential home.
+            continue;
+        }
+        let valid = name.to_str().is_some_and(|name| {
+            name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+        if !valid || !owner.file_type()?.is_dir() || owners_with_leases.len() >= 256 {
+            return Err(io::Error::other("The managed account storage contains an invalid owner directory"));
+        }
+        let root = owner.path();
+        validate_directory_path(&root)?;
+        let lock = lease(&root).map_err(|error| io::Error::other(error.code))?;
+        owners_with_leases.push((root, lock));
+    }
+    let mut homes = BTreeSet::new();
+    let owned: BTreeSet<_> = owners_with_leases.iter().map(|(root, _)| root.as_path()).collect();
+    let retained_path = accounts.join("retained-accounts.json");
+    if retained_path.try_exists()? {
+        let retained = crate::renderer_storage::read_json(&retained_path, 128 * 1024)?;
+        let entries = match retained.get("entries") {
+            None => &[][..],
+            Some(entries) => entries.as_array().filter(|entries| entries.len() <= 32)
+                .ok_or_else(|| io::Error::other("Invalid retained credential index"))?.as_slice(),
+        };
+        for entry in entries {
+            let owner = entry["owner"].as_str().filter(|owner| {
+                owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }).ok_or_else(|| io::Error::other("Invalid retained credential owner"))?;
+            let id = entry["connection"]["id"].as_str().filter(|id| valid_id(id))
+                .ok_or_else(|| io::Error::other("Invalid retained credential home"))?;
+            let root = accounts.join(owner);
+            if !owned.contains(root.as_path()) {
+                return Err(io::Error::other("A retained account points outside the validated owners"));
+            }
+            let home = root.join(id);
+            validate_directory_path(&home)?;
+            if home.try_exists()? {
+                homes.insert(home);
+            }
+        }
+    }
+    for (root, _lease) in &owners_with_leases {
+        let registry = load(root).map_err(|error| io::Error::other(error.code))?;
+        for connection in registry.connections {
+            let home = retention::home(root, &connection.id).map_err(|error| io::Error::other(error.code))?;
+            if !home.parent().is_some_and(|parent| owned.contains(parent)) {
+                return Err(io::Error::other("A managed account points outside the validated owner directories"));
+            }
+            if home.try_exists()? {
+                homes.insert(home);
+            }
+        }
+    }
+    for home in homes {
+        credentials::delete(&home).map_err(|error| io::Error::other(error.code))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod lease_tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_installation_purge_accepts_normal_primary_switch_metadata() {
+        let temporary = tempfile::TempDir::new_in("/private/tmp").unwrap();
+        let accounts = temporary.path().join("accounts");
+        let source_owner = "a".repeat(64);
+        let root = accounts.join(&source_owner);
+        std::fs::create_dir_all(&root).unwrap();
+        save(&root, &Registry { schema: 1, ..Registry::default() }).unwrap();
+        crate::renderer_storage::atomic(&accounts.join("retained-accounts.json"),
+            &json!({"followLogout": true, "entries": []})).unwrap();
+        let primary = accounts.join("primary-switch.json");
+        for state in ["completed", "cancelled"] {
+            crate::renderer_storage::atomic(&primary, &json!({
+                "sourceOwner": source_owner, "targetEmail": "synthetic@example.invalid",
+                "loginId": "", "state": state,
+            })).unwrap();
+            purge_managed_credentials(temporary.path()).expect("normal primary-switch metadata");
+        }
+        std::fs::remove_file(&primary).unwrap();
+        std::os::unix::fs::symlink(accounts.join("retained-accounts.json"), &primary).unwrap();
+        assert!(purge_managed_credentials(temporary.path()).is_err());
+        std::fs::remove_file(&primary).unwrap();
+        std::fs::create_dir(&primary).unwrap();
+        assert!(purge_managed_credentials(temporary.path()).is_err());
+        std::fs::remove_dir(&primary).unwrap();
+        let external = temporary.path().join("external.json");
+        std::fs::write(&external, "{}").unwrap();
+        std::fs::hard_link(external, &primary).unwrap();
+        assert!(purge_managed_credentials(temporary.path()).is_err());
+        std::fs::remove_file(&primary).unwrap();
+        std::fs::write(&primary, vec![b' '; 16 * 1024 + 1]).unwrap();
+        assert!(purge_managed_credentials(temporary.path()).is_err());
+        std::fs::remove_file(&primary).unwrap();
+        std::fs::write(accounts.join("unknown.json"), "{}").unwrap();
+        assert!(purge_managed_credentials(temporary.path()).is_err());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_installation_purge_rejects_unowned_retained_and_redirected_homes() {
+        let temporary = tempfile::TempDir::new_in("/private/tmp").unwrap();
+        let accounts = temporary.path().join("accounts");
+        let owner = accounts.join("a".repeat(64));
+        let id = "b".repeat(32);
+        std::fs::create_dir_all(&owner).unwrap();
+        let outside = tempfile::TempDir::new_in("/private/tmp").unwrap();
+        let redirected = owner.join(&id);
+        std::os::unix::fs::symlink(outside.path(), &redirected).unwrap();
+        save(&owner, &Registry {
+            schema: 1,
+            connections: vec![Connection { id: id.clone(), label: "fixture".into(), api: None, email: None, plan: None }],
+            ..Registry::default()
+        }).unwrap();
+        assert!(purge_managed_credentials(temporary.path()).is_err());
+        assert!(outside.path().is_dir());
+        std::fs::remove_file(redirected).unwrap();
+        let retained = accounts.join("retained-accounts.json");
+        for invalid_owner in ["../outside".to_string(), "c".repeat(64)] {
+            crate::renderer_storage::atomic(&retained, &json!({"entries":[{"owner":invalid_owner,"connection":{"id":id}}]})).unwrap();
+            assert!(purge_managed_credentials(temporary.path()).is_err());
+        }
+        std::fs::remove_file(retained).unwrap();
+        let lease = lease(&owner).unwrap();
+        assert!(purge_managed_credentials(temporary.path()).is_err());
+        drop(lease);
+        assert!(purge_managed_credentials(temporary.path()).is_ok());
+    }
     #[tokio::test]
     async fn leased_status_reads_do_not_call_official_account_or_admit_work() {
         let service=AccountService::default();

@@ -58,8 +58,8 @@ pub(crate) fn error_message(error: &(dyn Error + 'static)) -> String {
 
 pub(crate) fn environment() -> Value {
     let present = |key: &str| std::env::var_os(key).is_some_and(|s| !s.is_empty());
-    let mut value = json!({"httpProxyEnvPresent":present("HTTP_PROXY") || present("http_proxy"),"httpsProxyEnvPresent":present("HTTPS_PROXY") || present("https_proxy"),"allProxyEnvPresent":present("ALL_PROXY") || present("all_proxy"),"noProxyEnvPresent":present("NO_PROXY") || present("no_proxy"),"systemProxyAutoRead":cfg!(windows),"tlsBackend":"rustls","networkLibrary":"reqwest 0.12","observationOnly":true});
-    value["trustRoots"] = json!(if cfg!(windows) {
+    let mut value = json!({"httpProxyEnvPresent":present("HTTP_PROXY") || present("http_proxy"),"httpsProxyEnvPresent":present("HTTPS_PROXY") || present("https_proxy"),"allProxyEnvPresent":present("ALL_PROXY") || present("all_proxy"),"noProxyEnvPresent":present("NO_PROXY") || present("no_proxy"),"systemProxyAutoRead":cfg!(any(windows,target_os="macos")),"tlsBackend":"rustls","networkLibrary":"reqwest 0.12","observationOnly":true});
+    value["trustRoots"] = json!(if cfg!(any(windows,target_os="macos")) {
         "bundled-public-and-system-native"
     } else {
         "bundled-public"
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| e["action"] == "HTTP read retry")
+                .filter(|e| e["action"] == "HTTP read retry" && e["outcome"] == "started")
                 .count(),
             if error.is_timeout() { 0 } else { 1 }
         );

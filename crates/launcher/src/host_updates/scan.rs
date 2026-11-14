@@ -11,6 +11,9 @@ struct Scan<'a> {
     bytes: u64,
     started: Instant,
     rules: Vec<Rule>,
+    parsed_app_asar: bool,
+    #[cfg(target_os = "macos")]
+    bundle_links: bool,
 }
 impl Scan<'_> {
     fn budget(&self) -> io::Result<()> {
@@ -133,8 +136,18 @@ impl Scan<'_> {
             let name = path
                 .strip_prefix(self.root)
                 .map_err(io::Error::other)?
-                .to_string_lossy()
-                .replace('\\', "/");
+                .to_string_lossy();
+            #[cfg(windows)]
+            let name = name.replace('\\', "/");
+            #[cfg(not(windows))]
+            let name = name.into_owned();
+            #[cfg(target_os = "macos")]
+            if self.bundle_links && path.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
+                if let Err(e) = self.bundle_link(&path, &name) {
+                    self.issues.push(format!("bundle-link-incomplete: {name}; {e}"));
+                }
+                continue;
+            }
             let meta = match regular(&path) {
                 Ok(v) => v,
                 Err(_) => {
@@ -165,8 +178,9 @@ impl Scan<'_> {
             let result: io::Result<()> = (|| {
                 let mut file = fs::File::open(&path)?;
                 self.read(&name, &mut file, meta.len(), stamp.clone())?;
-                if name.ends_with("resources/app.asar") {
+                if name.to_ascii_lowercase().ends_with("resources/app.asar") {
                     self.asar(&mut file, &name, &stamp, meta.len())?;
+                    self.parsed_app_asar = true;
                 }
                 let after = fs::metadata(&path)?;
                 if after.len() != meta.len() || after.modified()? != meta.modified()? {
@@ -178,6 +192,41 @@ impl Scan<'_> {
                 self.issues.push(format!("file-incomplete: {name}; {e}"));
             }
         }
+        Ok(())
+    }
+    /// Framework aliases are part of a signed Mac bundle. Inventory the link
+    /// bytes, never traverse the alias; its ordinary target is scanned separately.
+    #[cfg(target_os = "macos")]
+    fn bundle_link(&mut self, path: &Path, name: &str) -> io::Result<()> {
+        use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+        self.budget()?;
+        let before = path.symlink_metadata()?;
+        let target = fs::read_link(path)?;
+        let bytes = target.as_os_str().as_bytes();
+        if !before.file_type().is_symlink() || bytes.len() > 4096 {
+            return Err(io::Error::other("invalid bundle link"));
+        }
+        let resolved = fs::canonicalize(path)?;
+        let root = fs::canonicalize(self.root)?;
+        if !resolved.starts_with(&root) || resolved == root {
+            return Err(io::Error::other("bundle link leaves the application"));
+        }
+        let after = path.symlink_metadata()?;
+        if !after.file_type().is_symlink() || before.dev() != after.dev()
+            || before.ino() != after.ino() || before.modified()? != after.modified()?
+            || fs::read_link(path)? != target {
+            return Err(io::Error::other("bundle link changed during scan"));
+        }
+        self.bytes = self.bytes.checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::other("bundle link byte budget"))?;
+        self.budget()?;
+        self.entries.insert(name.into(), Entry {
+            size: bytes.len() as u64,
+            sha256: hash(bytes),
+            kind: "bundle_symbolic_link".into(),
+            dependencies: self.classify(name, None),
+            stamp: format!("{}:{}", before.ino(), before.modified()?.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()),
+        });
         Ok(())
     }
     fn asar(&mut self, file: &mut fs::File, name: &str, stamp: &str, len: u64) -> io::Result<()> {
@@ -307,16 +356,24 @@ pub(super) fn inventory_owned(
         .executable
         .parent()
         .ok_or_else(|| io::Error::other("installation root"))?;
-    let root = parent
-        .parent()
-        .filter(|p| p.join("AppxManifest.xml").is_file())
-        .unwrap_or(parent);
+    let root = if install.source == crate::discovery::DiscoverySource::MacApplication {
+        let contents = parent.parent().filter(|p| p.file_name().is_some_and(|n| n == "Contents"))
+            .ok_or_else(|| io::Error::other("macOS installation Contents directory"))?;
+        if parent.file_name().is_none_or(|n| n != "MacOS") {
+            return Err(io::Error::other("macOS installation executable layout"));
+        }
+        contents.parent().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("app")))
+            .ok_or_else(|| io::Error::other("macOS application bundle root"))?
+    } else {
+        parent.parent().filter(|p| p.join("AppxManifest.xml").is_file()).unwrap_or(parent)
+    };
+    let package = install.package_full_name.as_ref().or(install.package_name.as_ref()).cloned().unwrap_or_default();
     private_dir(root)?;
     let observed = now();
     let same = old.is_some_and(|s| {
         s.root == root.to_string_lossy()
             && s.version == install.version
-            && s.package == install.package_full_name.clone().unwrap_or_default()
+            && s.package == package
     });
     let reuse = same && old.is_some_and(|s| s.registry_hash == registry_hash()) && !force;
     let mut scan = Scan {
@@ -329,22 +386,21 @@ pub(super) fn inventory_owned(
         bytes: 0,
         started: Instant::now(),
         rules: rules(),
+        parsed_app_asar: false,
+        #[cfg(target_os = "macos")]
+        bundle_links: install.source == crate::discovery::DiscoverySource::MacApplication,
     };
     if let Err(e) = scan.tree(root, 0) {
         scan.issues.push(format!("inventory-incomplete: {e}"));
     }
-    if !scan
-        .entries
-        .keys()
-        .any(|p| p.ends_with("resources/app.asar"))
-    {
-        scan.issues.push("official bundle was not observed".into())
+    if !scan.parsed_app_asar {
+        scan.issues.push("official bundle was not observed or expanded".into())
     }
     Ok(Snapshot {
         registry_hash: registry_hash(),
         schema: 1,
         version: install.version.clone(),
-        package: install.package_full_name.clone().unwrap_or_default(),
+        package,
         root: root.to_string_lossy().into(),
         observed_ms: observed,
         full_hash_ms: if reuse {

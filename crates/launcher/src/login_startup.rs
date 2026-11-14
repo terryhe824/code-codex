@@ -1,5 +1,8 @@
 //! Opt-in current-user login registration. The OS entry is the only source of
 //! truth: reading never creates a key and no launch can silently re-enable it.
+#[cfg(target_os = "macos")]
+#[path = "login_startup/macos.rs"]
+pub(crate) mod macos;
 use serde::Serialize;
 use std::{io, path::Path};
 
@@ -143,7 +146,11 @@ impl EntryStore for RegistryEntry<'_> {
 }
 
 pub(crate) fn status() -> io::Result<Status> {
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::status()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         Ok(Status {
             supported: false,
@@ -177,7 +184,11 @@ pub(crate) fn status() -> io::Result<Status> {
 }
 
 pub(crate) fn set(enabled: bool) -> io::Result<Status> {
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::set(enabled)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = enabled;
         Err(io::Error::other(

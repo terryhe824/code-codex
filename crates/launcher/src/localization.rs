@@ -6,6 +6,10 @@ static SESSION: RwLock<Option<Locale>> = RwLock::new(None);
 static CATALOGS: OnceLock<(serde_json::Value, serde_json::Value)> = OnceLock::new();
 
 pub(crate) fn system_locale() -> Locale {
+    #[cfg(target_os = "macos")]
+    if let Some(language) = macos_preferred_language() {
+        return locale_for_language(&language);
+    }
     #[cfg(windows)]
     {
         #[link(name = "kernel32")]
@@ -25,6 +29,43 @@ pub(crate) fn system_locale() -> Locale {
         }
     }
     Locale::English
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn locale_for_language(language: &str) -> Locale {
+    if language.split(['-', '_']).next().is_some_and(|s| s.eq_ignore_ascii_case("zh")) {
+        Locale::Chinese
+    } else {
+        Locale::English
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_preferred_language() -> Option<String> {
+    use std::ffi::{CStr, c_char, c_void};
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFLocaleCopyPreferredLanguages() -> *const c_void;
+        fn CFArrayGetCount(array: *const c_void) -> isize;
+        fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+        fn CFStringGetCString(string: *const c_void, buffer: *mut c_char, capacity: isize, encoding: u32) -> u8;
+        fn CFRelease(value: *const c_void);
+    }
+    // SAFETY: Copy returns an owned CFArray of CFStrings; index 0 is read only
+    // after a positive count, and the array is released exactly once below.
+    unsafe {
+        let languages = CFLocaleCopyPreferredLanguages();
+        if languages.is_null() { return None; }
+        let mut buffer = [0 as c_char; 256];
+        let value = if CFArrayGetCount(languages) > 0 {
+            let first = CFArrayGetValueAtIndex(languages, 0);
+            if !first.is_null() && CFStringGetCString(first, buffer.as_mut_ptr(), 256, 0x08000100) != 0 {
+                CStr::from_ptr(buffer.as_ptr()).to_str().ok().map(str::to_owned)
+            } else { None }
+        } else { None };
+        CFRelease(languages);
+        value
+    }
 }
 pub(crate) fn set_session(locale: Locale) {
     *SESSION
@@ -176,6 +217,15 @@ pub(crate) fn dialog_script(source: &str) -> String {
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
+    #[test]
+    fn preferred_language_uses_primary_language_not_substrings() {
+        for tag in ["zh", "zh-Hans-CN", "zh-Hant-TW", "ZH_hk"] {
+            assert_eq!(locale_for_language(tag), Locale::Chinese);
+        }
+        for tag in ["en", "en-US", "x-zh", "zho", "", "fr"] {
+            assert_eq!(locale_for_language(tag), Locale::English);
+        }
+    }
     #[test]
     fn powershell_catalog_literals_escape_all_single_quote_forms() {
         assert_eq!(powershell_single_quoted_content("a'b‘c’d‚e‛f"), "a''b‘‘c’’d‚‚e‛‛f");

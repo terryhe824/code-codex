@@ -24,6 +24,8 @@ mod startup_conflict;
 mod startup_recovery_ui;
 mod login_startup;
 mod menu_restart;
+#[cfg(target_os = "macos")]
+mod macos_installation;
 mod host_updates;
 mod startup_diagnostics;
 mod startup_examples;
@@ -90,6 +92,34 @@ enum LogFormat {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Install a verified local macOS app, retaining the previous version.
+    #[cfg(target_os = "macos")]
+    MacInstall {
+        #[arg(long)] source: PathBuf,
+        #[arg(long)] destination: Option<PathBuf>,
+        #[arg(long)] sha256: Option<String>,
+        /// Accept an ad-hoc signature for a local development build only.
+        #[arg(long)] allow_ad_hoc: bool,
+    },
+    /// Restore the verified previous macOS installation.
+    #[cfg(target_os = "macos")]
+    MacRollback {
+        #[arg(long)] destination: Option<PathBuf>,
+        #[arg(long)] allow_ad_hoc: bool,
+    },
+    /// Print a deterministic digest of a local macOS application package.
+    #[cfg(target_os = "macos")]
+    MacPackageDigest { #[arg(long)] source: PathBuf },
+    /// Remove only Code-Codex; preserve its user data unless explicitly confirmed.
+    #[cfg(target_os = "macos")]
+    MacUninstall {
+        #[arg(long)] destination: Option<PathBuf>,
+        #[arg(long)] purge_confirmation: Option<String>,
+        #[arg(long)] allow_ad_hoc: bool,
+    },
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    MacUninstallDialog { #[arg(long)] destination: PathBuf },
     /// Read-only local official-package change ledger and per-user observation task.
     HostUpdates {
         #[arg(long)] force: bool,
@@ -306,9 +336,32 @@ fn main() -> ExitCode {
     application_main()
 }
 
+#[cfg(target_os = "macos")]
+fn mac_installation_dispatch(command: &Commands) -> Option<std::io::Result<Value>> {
+    Some(match command {
+        Commands::MacInstall {source,destination,sha256,allow_ad_hoc} =>
+            macos_installation::install(source,destination.as_deref(),sha256.as_deref(),*allow_ad_hoc),
+        Commands::MacRollback {destination,allow_ad_hoc} =>
+            macos_installation::rollback(destination.as_deref(),*allow_ad_hoc),
+        Commands::MacPackageDigest {source} =>
+            macos_installation::fingerprint(source).map(|sha256| json!({"sha256":sha256})),
+        Commands::MacUninstall {destination,purge_confirmation,allow_ad_hoc} =>
+            macos_installation::uninstall(destination.as_deref(),purge_confirmation.as_deref(),*allow_ad_hoc),
+        Commands::MacUninstallDialog {destination} => macos_installation::uninstall_dialog(destination),
+        _ => return None,
+    })
+}
+
 #[tokio::main]
 async fn application_main() -> ExitCode {
     let cli = Cli::parse();
+    #[cfg(target_os = "macos")]
+    if let Some(result) = cli.command.as_ref().and_then(mac_installation_dispatch) {
+        return match result {
+            Ok(value) => { println!("{value}"); ExitCode::SUCCESS }
+            Err(error) => { eprintln!("Mac installation: {error}"); ExitCode::from(25) }
+        };
+    }
     if let Some(Commands::LoginStartup { enable, disable }) = &cli.command {
         let result = if *enable {
             login_startup::set(true)
@@ -341,6 +394,9 @@ async fn application_main() -> ExitCode {
         .command
         .unwrap_or_else(|| Commands::Run(default_run_args()));
     let mode = match &command {
+        #[cfg(target_os = "macos")]
+        Commands::MacInstall {..} | Commands::MacRollback {..} | Commands::MacPackageDigest {..} |
+        Commands::MacUninstall {..} | Commands::MacUninstallDialog {..} => unreachable!("handled before initialization"),
         Commands::HostUpdates {..} => "host-updates",
         Commands::MenuRestart {..} => "menu-restart",
         Commands::Run(_) => "run",
@@ -359,6 +415,9 @@ async fn application_main() -> ExitCode {
     #[cfg(windows)]
     process_preflight::observe_origin(mode);
     let result = match command {
+        #[cfg(target_os = "macos")]
+        Commands::MacInstall {..} | Commands::MacRollback {..} | Commands::MacPackageDigest {..} |
+        Commands::MacUninstall {..} | Commands::MacUninstallDialog {..} => unreachable!("handled before initialization"),
         Commands::HostUpdates {..} => unreachable!("handled before initialization"),
         Commands::MenuRestart {port,pid,created_ms} => menu_restart::run(port,pid,created_ms).await.map_err(AppError::StartupConflict),
         Commands::Run(args) => run(args).await,
@@ -515,6 +574,7 @@ mod win10_compat_integration_tests {
         });
         (CdpEndpoint::loopback(port), task)
     }
+    #[cfg(windows)]
     #[tokio::test]
     async fn win10_fallback_uses_verified_ready_renderer_but_not_tcp_alone() {
         let (renderer, server) = renderer_fixture(true).await;
@@ -543,6 +603,7 @@ mod win10_compat_integration_tests {
         server.abort();
         assert!(result.is_err(), "unqualified UI must not allow fallback");
     }
+    #[cfg(windows)]
     #[tokio::test]
     async fn win10_foreign_main_listener_is_rejected_and_has_precise_support_code() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

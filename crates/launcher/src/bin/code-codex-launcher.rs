@@ -60,10 +60,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let command_line = current.with_file_name("code-codex.exe");
+    let command_line = current.with_file_name(if cfg!(target_os = "macos") { "code-codex-core" } else { "code-codex.exe" });
     if !command_line.is_file() {
         show_fallback_error(
-            "The sibling code-codex.exe is missing or is not a regular file.",
+            "The sibling Code-Codex core is missing or is not a regular file.",
             started,
         );
         return ExitCode::FAILURE;
@@ -744,7 +744,7 @@ fn spawn_startup_error(
     Some(child)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn spawn_startup_error(
     _: &StartupDiagnostic,
     _: &str,
@@ -754,7 +754,7 @@ fn spawn_startup_error(
     None
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn show_startup_error(diagnostic: &StartupDiagnostic, details: &str, report_path: Option<&Path>) {
     eprintln!(
         "{ERROR_TITLE}: {}\n{}\nReport: {}\n\n{}",
@@ -765,6 +765,38 @@ fn show_startup_error(diagnostic: &StartupDiagnostic, details: &str, report_path
             .unwrap_or_else(|| "unavailable".to_owned()),
         details
     );
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_startup_error(
+    diagnostic: &StartupDiagnostic,
+    _details: &str,
+    report_path: Option<&Path>,
+    _state_path: Option<&Path>,
+) -> Option<std::process::Child> {
+    use std::io::Write;
+    // Diagnostic data is argv, never AppleScript or shell source. The report
+    // keeps complete evidence while the native alert is deliberately bounded.
+    let message = format!("{}\n\n{}\n\nReport: {}", diagnostic.summary,
+        diagnostic.reason.chars().take(3000).collect::<String>(),
+        report_path.map(|p| p.display().to_string()).unwrap_or_else(|| "unavailable".into()));
+    let mut child = Command::new("/usr/bin/osascript")
+        .arg("-").arg(ERROR_TITLE).arg(message)
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok()?;
+    let source = b"on run argv\n display alert (item 1 of argv) message (item 2 of argv) as critical buttons {\"OK\"} default button \"OK\"\nend run\n";
+    if child.stdin.take()?.write_all(source).is_err() {
+        let _ = child.kill(); let _ = child.wait(); return None;
+    }
+    Some(child)
+}
+
+#[cfg(target_os = "macos")]
+fn show_startup_error(diagnostic: &StartupDiagnostic, details: &str, report_path: Option<&Path>) {
+    if let Some(mut child) = spawn_startup_error(diagnostic, details, report_path, None) {
+        let _ = child.wait();
+    } else {
+        eprintln!("{ERROR_TITLE}: {}\n{}", diagnostic.summary, diagnostic.reason);
+    }
 }
 
 fn show_fallback_error(reason: &str, started: Instant) {

@@ -20,7 +20,13 @@ use tokio::sync::{Mutex, RwLock, broadcast, oneshot};
 
 #[cfg(windows)]
 use process_wrap::tokio::{CreationFlags, JobObject};
-use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
+#[cfg(not(target_os = "macos"))]
+use process_wrap::tokio::{KillOnDrop, TokioCommandWrap};
+use process_wrap::tokio::TokioChildWrapper;
+#[cfg(target_os = "macos")]
+mod owned_backend;
+#[cfg(target_os = "macos")]
+pub use owned_backend::spawn_owned_backend;
 #[cfg(windows)]
 use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
@@ -220,13 +226,19 @@ impl AppServerClient {
         for (name, value) in &command.environment {
             process.env(name, value);
         }
-        let mut process = TokioCommandWrap::from(process);
-        #[cfg(windows)]
-        process.wrap(CreationFlags(CREATE_NO_WINDOW));
-        process.wrap(KillOnDrop);
-        #[cfg(windows)]
-        process.wrap(JobObject);
-        let mut child = process.spawn().map_err(|error| {
+        #[cfg(target_os = "macos")]
+        let child = spawn_owned_backend(process);
+        #[cfg(not(target_os = "macos"))]
+        let child = {
+            let mut process = TokioCommandWrap::from(process);
+            #[cfg(windows)]
+            process.wrap(CreationFlags(CREATE_NO_WINDOW));
+            process.wrap(KillOnDrop);
+            #[cfg(windows)]
+            process.wrap(JobObject);
+            process.spawn()
+        };
+        let mut child = child.map_err(|error| {
             ResolverError::Spawn.context(
                 "starting App Server child",
                 format!(
@@ -510,6 +522,88 @@ pub fn executable_exists(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_drop_cleans_app_server_descendants() {
+        let fixture = tempfile::tempdir().unwrap();
+        let pid_file = fixture.path().join("descendant.pid");
+        let marker = fixture.path().join("descendant-lived");
+        let mut command = AppServerCommand::codex("/usr/bin/perl");
+        command.args = vec![
+            "-e".into(),
+            r#"use JSON::PP; $|=1;
+               my ($pid_file, $marker)=@ARGV;
+               my $line = <STDIN>;
+               my $id = decode_json($line)->{id};
+               my $child=fork();
+               die $! unless defined $child;
+               if ($child) {
+                 open my $pid, '>', $pid_file or die $!;
+                 print $pid $child;
+                 close $pid or die $!;
+                 print encode_json({id=>$id,result=>{}}), "\n";
+                 <STDIN>;
+                 exit 0;
+               }
+               select(undef,undef,undef,0.8);
+               open my $survived, '>', $marker or die $!;
+               print $survived 'escaped cleanup';"#.into(),
+            pid_file.as_os_str().into(),
+            marker.as_os_str().into(),
+        ];
+        let client = AppServerClient::connect(&command).await.unwrap();
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let output = std::process::Command::new("/bin/ps")
+            .args(["-o", "pid=,pgid=,sess=", "-p", &pid]).output().unwrap();
+        assert!(output.status.success());
+        let fields: Vec<_> = std::str::from_utf8(&output.stdout).unwrap().split_whitespace().collect();
+        assert_eq!(fields[0], pid);
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(950)).await;
+        assert!(!marker.exists(), "owned App Server descendant was still running after client drop");
+        let descendant_group: i32 = fields[1].parse().unwrap();
+        assert_ne!(descendant_group, nix::unistd::getpgrp().as_raw());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_cancelling_initialization_cleans_owned_backend_descendants() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ready = fixture.path().join("backend.ready");
+        let marker = fixture.path().join("descendant-lived");
+        let mut command = AppServerCommand::codex("/usr/bin/perl");
+        command.args = vec![
+            "-e".into(),
+            r#"my ($ready,$marker)=@ARGV;
+               my $request=<STDIN>;
+               my $child=fork();
+               die $! unless defined $child;
+               if ($child) {
+                 open my $signal, '>', $ready or die $!;
+                 close $signal;
+                 waitpid($child, 0);
+                 exit 0;
+               }
+               select(undef,undef,undef,0.8);
+               open my $survived, '>', $marker or die $!;
+               print $survived 'escaped cleanup';"#.into(),
+            ready.as_os_str().into(),
+            marker.as_os_str().into(),
+        ];
+        let task = tokio::spawn(async move { AppServerClient::connect(&command).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.err().unwrap().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!marker.exists(), "backend descendant survived initialization cancellation");
+    }
 
     #[test]
     fn context_keeps_resolver_error_family_and_bounded_details() {

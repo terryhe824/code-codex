@@ -9,11 +9,13 @@ use std::time::{Duration, Instant};
 use sha2::Sha256;
 use zip::CompressionMethod;
 
+#[cfg(windows)]
+use super::NATIVE_POWERPOINT_COM_UNAVAILABLE_EXIT_CODE;
 use super::{
     MAX_NATIVE_POWERPOINT_CACHE_ENTRIES, MAX_NATIVE_POWERPOINT_PREVIEW_BYTES,
     MAX_NATIVE_POWERPOINT_SLIDE_BYTES, MAX_NATIVE_POWERPOINT_SLIDES, MAX_OFFICE_PREVIEW_BYTES,
-    MIN_NATIVE_POWERPOINT_SOURCE_BYTES, NATIVE_POWERPOINT_COM_UNAVAILABLE_EXIT_CODE,
-    NATIVE_POWERPOINT_TIMEOUT, NATIVE_POWERPOINT_WIDTH, media_version,
+    MIN_NATIVE_POWERPOINT_SOURCE_BYTES, NATIVE_POWERPOINT_TIMEOUT, NATIVE_POWERPOINT_WIDTH,
+    media_version,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -430,7 +432,87 @@ pub(super) fn run_native_powerpoint_export(
     Err(NativePowerPointRenderError::PowerpointUnavailable)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub(super) fn run_native_powerpoint_export(
+    _source: &Path,
+    _output: &Path,
+    _pid_state: &Path,
+) -> Result<(), NativePowerPointRenderError> {
+    Err(macos_native_preview_unavailable(
+        macos_powerpoint_is_installed("com.microsoft.Powerpoint"),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_native_preview_unavailable(
+    installation: Result<bool, String>,
+) -> NativePowerPointRenderError {
+    match installation {
+        Ok(false) => NativePowerPointRenderError::PowerpointUnavailable,
+        Ok(true) => NativePowerPointRenderError::Failed(
+            "PowerPoint found, but safe native automation capability is unverified on macOS"
+                .to_owned(),
+        ),
+        Err(error) => NativePowerPointRenderError::Failed(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_powerpoint_is_installed(bundle_id: &str) -> Result<bool, String> {
+    use std::process::{Command, Stdio};
+
+    const DISCOVER: &str = r#"
+function run(argv) {
+    ObjC.import("AppKit");
+    const url = $.NSWorkspace.sharedWorkspace.URLForApplicationWithBundleIdentifier(argv[0]);
+    return url.isNil() ? "missing" : "installed";
+}
+"#;
+    // Query Launch Services only. The lookup does not launch Office, send an
+    // Apple event to it, load a presentation, or alter permissions.
+    let mut child = Command::new("/usr/bin/osascript")
+        .args(["-l", "JavaScript", "-e", DISCOVER, "--", bundle_id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "PowerPoint installation detection could not start".to_owned())?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let mut answer = String::new();
+                child
+                    .stdout
+                    .take()
+                    .ok_or("PowerPoint installation detection had no result")?
+                    .take(16)
+                    .read_to_string(&mut answer)
+                    .map_err(|_| "PowerPoint installation detection could not read its result")?;
+                return match answer.trim_end() {
+                    "installed" => Ok(true),
+                    "missing" => Ok(false),
+                    _ => Err(
+                        "PowerPoint installation detection returned an invalid result".to_owned(),
+                    ),
+                };
+            }
+            Ok(Some(_)) => return Err("PowerPoint installation detection failed".to_owned()),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(if result.is_ok() {
+                    "PowerPoint installation detection timed out".to_owned()
+                } else {
+                    "PowerPoint installation detection could not be monitored".to_owned()
+                });
+            }
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(super) fn run_native_powerpoint_export(
     _source: &Path,
     _output: &Path,
@@ -590,4 +672,33 @@ pub(super) fn render_native_powerpoint_bundle(
         format!("the PowerPoint preview directory could not be removed: {error}")
     })?;
     Ok(bundle)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    #[test]
+    fn macos_native_preview_distinguishes_installed_unqualified_and_missing() {
+        assert!(matches!(
+            macos_native_preview_unavailable(Ok(false)),
+            NativePowerPointRenderError::PowerpointUnavailable
+        ));
+        assert!(matches!(
+            macos_native_preview_unavailable(Ok(true)),
+            NativePowerPointRenderError::Failed(message) if message.contains("automation capability")
+        ));
+        assert!(matches!(
+            macos_native_preview_unavailable(Err("PowerPoint installation detection timed out".to_owned())),
+            NativePowerPointRenderError::Failed(message) if message.contains("detection timed out")
+        ));
+    }
+
+    #[test]
+    fn macos_powerpoint_detection_uses_launch_services() {
+        assert!(
+            !macos_powerpoint_is_installed("com.invalid.CodeCodexAbsentFixture")
+                .expect("Launch Services lookup")
+        );
+    }
 }

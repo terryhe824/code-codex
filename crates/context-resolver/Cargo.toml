@@ -14,6 +14,10 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+process-wrap = { workspace = true, features = ["process-session"] }
+nix = { version = "0.30.1", features = ["process", "signal"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = ["Win32_System_Threading"] }
 

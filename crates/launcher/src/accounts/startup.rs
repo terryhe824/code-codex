@@ -23,7 +23,7 @@ pub(crate) fn qualify(installation:&crate::discovery::CodexInstallation)->bool {
  if ["CODEX_APP_SERVER_OPENAI_BASE_URL","CODEX_APP_SERVER_CHATGPT_BASE_URL"].iter().any(|k|std::env::var_os(k).is_some()){return false;}
  (||->std::io::Result<bool>{
   use std::io::{Read,Seek,SeekFrom};
-  let path=installation.executable.parent().ok_or_else(||std::io::Error::other("image parent"))?.join("resources/app.asar");
+  let path=crate::bootstrap::app_asar_path(&installation.executable).ok_or_else(||std::io::Error::other("image parent"))?;
   let mut file=std::fs::File::open(path)?;let mut bytes=[0u8;16];file.read_exact(&mut bytes)?;
   let header_size=u32::from_le_bytes(bytes[4..8].try_into().unwrap())as u64;
   let json_size=u32::from_le_bytes(bytes[12..16].try_into().unwrap())as usize;

@@ -1,6 +1,13 @@
 //! Trusted release identity shared by application and standalone setup.
 pub(crate) const GITHUB_LATEST_RELEASE_ENDPOINT: &str =
     "https://api.github.com/repos/Rice-dog/code-codex/releases/latest";
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_release_feed_unavailable() -> BridgeError {
+    BridgeError::new(
+        "UPDATE_MACOS_FEED_UNAVAILABLE",
+        "The trusted macOS update feed is not configured. Local macOS packages can be installed with mac-install.",
+    )
+}
 use cdp_client::BridgeError;
 use serde::Deserialize;
 pub(crate) const MIN_UPDATE_ASSET_BYTES: u64 = 256 * 1024;

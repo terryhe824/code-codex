@@ -5,6 +5,47 @@ use super::{AccountError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+fn is_explicit_loopback(url: &reqwest::Url) -> bool {
+    matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+}
+
+pub(super) fn for_http_target(
+    builder: reqwest::ClientBuilder,
+    target: &reqwest::Url,
+) -> reqwest::ClientBuilder {
+    if is_explicit_loopback(target) {
+        loopback_client(builder)
+    } else {
+        builder
+    }
+}
+
+pub(super) fn loopback_client(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    // Fix the address of explicit localhost requests at the transport layer.
+    // Keep IPv6 available to IP URLs while avoiding system DNS for localhost.
+    builder
+        .no_proxy()
+        .resolve_to_addrs(
+            "localhost",
+            &[
+                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+            ],
+        )
+}
+
+pub(super) fn transport_for<'a>(
+    configured: &'a reqwest::Client,
+    direct: &'a reqwest::Client,
+    target: &reqwest::Url,
+) -> &'a reqwest::Client {
+    if is_explicit_loopback(target) {
+        direct
+    } else {
+        configured
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all="camelCase", deny_unknown_fields)]
 pub(super) struct Settings { pub base_url:String, pub model:String, #[serde(default,skip_serializing_if="Option::is_none")] pub models:Option<Vec<String>> }
@@ -31,7 +72,7 @@ impl Settings {
     }
     pub fn parse(base:&str,model:&str)->Result<Self>{
         let mut url=reqwest::Url::parse(base.trim()).map_err(|_|invalid("endpoint-parse"))?;
-        let local=matches!(url.host_str(),Some("localhost"|"127.0.0.1"|"[::1]"));
+        let local = is_explicit_loopback(&url);
         if base.len()>2048 || url.host_str().is_none() || !(url.scheme()=="https" || local&&url.scheme()=="http") || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some(){return Err(invalid("endpoint-origin"));}
         let path=url.path().trim_end_matches('/').to_owned();
         if path.ends_with("/responses") || path.ends_with("/responses/compact") || path.contains("/console"){return Err(invalid("endpoint-base-path"));}
@@ -45,6 +86,7 @@ fn invalid(stage:&str)->AccountError{AccountError::new("ACCOUNT_API_CONFIGURATIO
 pub(super) fn validate_key(key:&str)->Result<()>{
     if key.is_empty()||key.len()>2400||!key.bytes().all(|c|c.is_ascii_graphic()) {return Err(AccountError::new("ACCOUNT_API_KEY","The API key must contain 1-2400 printable ASCII characters without whitespace. No request was sent."));}Ok(())
 }
+#[cfg(windows)]
 fn target(home:&Path)->Result<Vec<u16>>{
     use sha2::{Digest,Sha256};
     workspace_service::application_paths::validate_directory_path(home).map_err(|_|invalid("credential-path"))?;
@@ -54,19 +96,27 @@ fn target(home:&Path)->Result<Vec<u16>>{
     Ok(format!("secrets|{}.codex",&hash[..16]).encode_utf16().chain(Some(0)).collect())
 }
 pub(super) fn store(home:&Path,key:&str)->Result<()>{
-    validate_key(key)?;let target=target(home)?;
+    validate_key(key)?;
     #[cfg(windows)] unsafe {
+        let target=target(home)?;
         use windows_sys::Win32::Security::Credentials::{CREDENTIALW,CredWriteW};
         let mut bytes=key.as_bytes().to_vec();
         let credential=CREDENTIALW{Type:1,TargetName:target.as_ptr() as _,CredentialBlobSize:bytes.len() as u32,CredentialBlob:bytes.as_mut_ptr(),Persist:2,..std::mem::zeroed()};
         let ok=CredWriteW(&credential,0)!=0;bytes.fill(0);
         if !ok{return Err(AccountError::new("ACCOUNT_API_KEY_STORAGE","The API key could not be stored in Windows Credential Manager. No connection was added."));}Ok(())
     }
-    #[cfg(not(windows))] {let _=(home,key,target);Err(AccountError::new("ACCOUNT_API_KEY_STORAGE","This build has no supported native API credential vault."))}
+    #[cfg(target_os = "macos")]
+    {
+        let account = super::credentials::mac_home_hash(home)?;
+        super::credentials::mac_set_password(super::credentials::MAC_API_SERVICE, &account, key.as_bytes())
+            .map_err(|_| AccountError::new("ACCOUNT_API_KEY_STORAGE", "The API key could not be stored in macOS Keychain. No connection was added."))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {let _=home;Err(AccountError::new("ACCOUNT_API_KEY_STORAGE","This build has no supported native API credential vault."))}
 }
 pub(super) fn read(home:&Path)->Result<String>{
-    let target=target(home)?;
     #[cfg(windows)] unsafe {
+        let target=target(home)?;
         use windows_sys::Win32::Security::Credentials::{CredReadW,CredFree};
         let mut raw=std::ptr::null_mut();
         if CredReadW(target.as_ptr(),1,0,&mut raw)==0{return Err(AccountError::new("ACCOUNT_API_KEY_MISSING","The API credential is unavailable. Edit this connection and enter its key again. No fallback account was used."));}
@@ -74,7 +124,21 @@ pub(super) fn read(home:&Path)->Result<String>{
         let value=if item.CredentialBlobSize>0&&item.CredentialBlobSize<=2400&&!item.CredentialBlob.is_null(){String::from_utf8(std::slice::from_raw_parts(item.CredentialBlob,item.CredentialBlobSize as usize).to_vec()).ok()}else{None};
         CredFree(raw as _);let key=value.ok_or_else(||invalid("credential-shape"))?;validate_key(&key)?;Ok(key)
     }
-    #[cfg(not(windows))] {let _=target;Err(AccountError::new("ACCOUNT_API_KEY_STORAGE","This build has no supported native API credential vault."))}
+    #[cfg(target_os = "macos")]
+    {
+        let account = super::credentials::mac_home_hash(home)?;
+        let mut bytes = super::credentials::mac_get_password(super::credentials::MAC_API_SERVICE, &account)
+            .ok().flatten()
+            .ok_or_else(|| AccountError::new("ACCOUNT_API_KEY_MISSING", "The API credential is unavailable. Edit this connection and enter its key again. No fallback account was used."))?;
+        let key = std::str::from_utf8(&bytes)
+            .ok().filter(|s| s.len() <= 2400).map(str::to_owned);
+        bytes.fill(0);
+        let key = key.ok_or_else(|| invalid("credential-shape"))?;
+        validate_key(&key)?;
+        Ok(key)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {let _=home;Err(AccountError::new("ACCOUNT_API_KEY_STORAGE","This build has no supported native API credential vault."))}
 }
 
 #[cfg(test)] mod tests {
@@ -97,8 +161,16 @@ pub(super) fn read(home:&Path)->Result<String>{
         for model in ["","model\nsecret","model with spaces"]{assert!(Settings::parse("https://example.invalid/v1",model).is_err());}
         for key in ["","secret\nheader"," secret","secret "]{assert!(validate_key(key).is_err());}
     }
-    #[test] #[cfg(windows)] fn isolated_native_vault_roundtrip_and_delete(){
-        let dir=tempfile::tempdir().unwrap();store(dir.path(),"synthetic-api-credential").unwrap();assert_eq!(read(dir.path()).unwrap(),"synthetic-api-credential");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(),0);super::super::credentials::delete(dir.path()).unwrap();assert!(read(dir.path()).is_err());
+    #[test] #[cfg(any(windows, target_os = "macos"))] fn isolated_native_vault_roundtrip_and_delete(){
+        let dir=tempfile::tempdir().unwrap();
+        let home=dir.path().canonicalize().unwrap();
+        struct Cleanup<'a>(&'a Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) { let _ = super::super::credentials::delete(self.0); }
+        }
+        let _cleanup=Cleanup(&home);
+        store(&home,"synthetic-api-credential").unwrap();assert_eq!(read(&home).unwrap(),"synthetic-api-credential");
+        store(&home,"synthetic-api-credential-replacement").unwrap();assert_eq!(read(&home).unwrap(),"synthetic-api-credential-replacement");
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(),0);super::super::credentials::delete(&home).unwrap();assert!(read(&home).is_err());
     }
 }

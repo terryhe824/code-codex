@@ -2,7 +2,9 @@
 use super::{AccountError, Result};
 #[cfg(windows)]
 use process_wrap::tokio::{CreationFlags, JobObject};
-use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
+#[cfg(any(not(target_os = "macos"), test))]
+use process_wrap::tokio::{KillOnDrop, TokioCommandWrap};
+use process_wrap::tokio::TokioChildWrapper;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -20,6 +22,18 @@ use tokio::{
 };
 
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
+const WORKER_ENVIRONMENT: &[&str] = &[
+    #[cfg(target_os = "macos")]
+    "HOME",
+    #[cfg(target_os = "macos")]
+    "SHELL",
+    #[cfg(target_os = "macos")]
+    "TMPDIR",
+    "SystemRoot", "WINDIR", "PATH", "PATHEXT", "TEMP", "TMP", "COMSPEC", "SYSTEMDRIVE",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
+    "USERPROFILE", "APPDATA", "LOCALAPPDATA", "USERNAME", "USERDOMAIN", "HOMEDRIVE", "HOMEPATH",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+];
 type Reply = oneshot::Sender<Result<Value>>;
 struct PendingSlot<'a>{slots:&'a std::sync::Mutex<HashMap<u64,Reply>>,id:u64}
 impl Drop for PendingSlot<'_>{fn drop(&mut self){self.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&self.id);}}
@@ -80,28 +94,7 @@ impl Worker {
         })?;
         let mut command = tokio::process::Command::new(launch.executable());
         command.env_clear();
-        for key in [
-            "SystemRoot",
-            "WINDIR",
-            "PATH",
-            "PATHEXT",
-            "TEMP",
-            "TMP",
-            "COMSPEC",
-            "SYSTEMDRIVE",
-            "PROGRAMFILES",
-            "PROGRAMFILES(X86)",
-            "PROCESSOR_ARCHITECTURE",
-            "NUMBER_OF_PROCESSORS",
-            "USERPROFILE",
-            "APPDATA",
-            "LOCALAPPDATA",
-            "USERNAME",
-            "USERDOMAIN",
-            "HOMEDRIVE",
-            "HOMEPATH",
-            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-        ] {
+        for key in WORKER_ENVIRONMENT {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
             }
@@ -109,6 +102,10 @@ impl Worker {
         if let Some(path) = launch.sanitized_path() {
             command.env("PATH", path);
         }
+        #[cfg(target_os = "macos")]
+        let (storage_mode, secret_storage) = super::credentials::mac_storage_config(home)?;
+        #[cfg(not(target_os = "macos"))]
+        let storage_mode = super::credentials::storage_mode(home)?;
         command.current_dir(launch.hardened_working_directory().unwrap_or(home));
         command
             .env("CODEX_HOME", home)
@@ -118,7 +115,7 @@ impl Worker {
                 "--listen",
                 "stdio://",
                 "-c",
-                &format!("cli_auth_credentials_store={}",json!(super::credentials::storage_mode(home)?)),
+                &format!("cli_auth_credentials_store={}",json!(storage_mode)),
                 "-c",
                 "analytics.enabled=false",
 
@@ -126,6 +123,11 @@ impl Worker {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(target_os = "macos")]
+        if let Some(secret_storage) = secret_storage {
+            let override_value = format!("features.secret_auth_storage={secret_storage}");
+            command.args(["-c", &override_value]);
+        }
         // The executable import search path stays hardened. Child shell tools
         // receive the user's actual PATH through the official shell policy.
         if let Some(path) = std::env::var_os("PATH") {
@@ -137,16 +139,22 @@ impl Worker {
         if !home.join("config.toml").exists() {
             command.args(["-c", "approval_policy=\"on-request\"", "-c", "sandbox_mode=\"read-only\""]);
         }
-        let mut command = TokioCommandWrap::from(command);
-        command.wrap(KillOnDrop);
-        #[cfg(windows)]
-        {
-            command.wrap(CreationFlags(
-                windows::Win32::System::Threading::CREATE_NO_WINDOW,
-            ));
-            command.wrap(JobObject);
-        }
-        let child = command.spawn().map_err(|e| {
+        #[cfg(target_os = "macos")]
+        let child = context_resolver::spawn_owned_backend(command);
+        #[cfg(not(target_os = "macos"))]
+        let child = {
+            let mut command = TokioCommandWrap::from(command);
+            command.wrap(KillOnDrop);
+            #[cfg(windows)]
+            {
+                command.wrap(CreationFlags(
+                    windows::Win32::System::Threading::CREATE_NO_WINDOW,
+                ));
+                command.wrap(JobObject);
+            }
+            command.spawn()
+        };
+        let child = child.map_err(|e| {
             AccountError::new(
                 "ACCOUNT_SPAWN",
                 format!("Starting the isolated account backend failed. stage=process-start; osCode={:?}; kind={:?}.",e.raw_os_error(),e.kind()),
@@ -462,6 +470,7 @@ impl Worker {
         let _=self.stop_physical().await;
     }
     pub(super) async fn stop_physical(&self)->Result<()> {
+        #[cfg(not(target_os = "macos"))]
         if self.dead.load(Ordering::Acquire){return Ok(());}
         std::pin::Pin::from(self.child.lock().await.kill()).await.map_err(|_|AccountError::new("ACCOUNT_LOGOUT_STOP","The isolated account backend could not be stopped; process exit remains unconfirmed."))?;
         self.dead.store(true,Ordering::Release);Ok(())
@@ -531,6 +540,16 @@ fn sanitize_error(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_worker_environment_keeps_shell_context_and_filters_credential_variables() {
+        for required in ["HOME", "PATH", "SHELL", "TMPDIR"] {
+            assert!(WORKER_ENVIRONMENT.contains(&required));
+        }
+        for excluded in ["CODEX_HOME", "CODEX_SQLITE_HOME", "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "DYLD_INSERT_LIBRARIES"] {
+            assert!(!WORKER_ENVIRONMENT.contains(&excluded));
+        }
+    }
     #[tokio::test]
     #[cfg(windows)]
     async fn diagnostics_follow_real_jsonl_error_timeout_and_post_initialize_stderr_without_replay() {
@@ -662,6 +681,53 @@ while($null -ne ($line=[Console]::ReadLine())) {
         let proof=outcome.expect("Live acceptance failed; authentication responses and tokens are withheld.");
         std::fs::write(std::env::var_os("ACCOUNT_REAL_PROOF").unwrap(),serde_json::to_vec_pretty(&proof).unwrap()).unwrap();
     }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_explicit_stop_cleans_backend_tree_after_transport_eof() {
+        let home = tempfile::tempdir().unwrap();
+        let marker = home.path().join("descendant-lived");
+        let mut command = tokio::process::Command::new("/usr/bin/perl");
+        command
+            .args([
+                "-e",
+                r#"use JSON::PP;
+                   $|=1;
+                   my $line = <STDIN>;
+                   my $request = decode_json($line);
+                   my $pid = fork();
+                   die $! unless defined $pid;
+                   if ($pid) {
+                     print encode_json({id=>$request->{id},result=>{}}), "\n";
+                     my $initialized = <STDIN>;
+                     close STDOUT;
+                     exit 0;
+                   }
+                   close STDOUT;
+                   select(undef,undef,undef,0.8);
+                   open my $marker, '>', $ARGV[0] or die $!;
+                   print $marker 'escaped cleanup';"#,
+            ])
+            .arg(&marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = context_resolver::spawn_owned_backend(command).unwrap();
+        let worker = Worker::connect(child, None, home.path(), &home.path().join("sqlite"), None, None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !worker.is_dead() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.stop_physical().await.unwrap();
+        worker.stop_physical().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!marker.exists(), "owned account descendant survived physical stop after EOF");
+    }
+
     #[test]
     fn auth_failure_details_are_withheld() {
         for text in ["accessToken=private", "authToken: private", "Authorization: Bearer private", "eyJprivate.payload.signature", "refreshToken=private"]{assert!(!sanitize_error(&json!(text)).contains("private"));}

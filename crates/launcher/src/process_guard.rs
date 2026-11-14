@@ -1,3 +1,7 @@
+#[cfg(target_os = "macos")]
+#[path = "process_guard/macos.rs"]
+mod macos;
+
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
@@ -490,7 +494,9 @@ impl CodexProcessGuard {
 /// The handle is opened only for synchronization, so diagnostics do not need
 /// access to the process command line or private filesystem paths.
 pub fn launched_process_state(pid: u32) -> String {
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    { macos::launched_process_state(pid) }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = pid;
         "unavailable on this platform".to_owned()
@@ -1321,12 +1327,22 @@ pub(crate) fn retain_native_identity(
     Ok(handle)
 }
 
+#[cfg(target_os = "macos")]
 fn verify_process_identity_inner(
     pid: u32,
     launched_after: SystemTime,
     official_executable: &Path,
 ) -> Result<(), ProcessGuardError> {
-    #[cfg(not(windows))]
+    macos::verified_process_identity(pid, launched_after, official_executable).map(drop)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_process_identity_inner(
+    pid: u32,
+    launched_after: SystemTime,
+    official_executable: &Path,
+) -> Result<(), ProcessGuardError> {
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (pid, launched_after, official_executable);
         Err(ProcessGuardError::OwnershipUnknown)
@@ -1495,7 +1511,11 @@ fn verify_listener_owner_inner(
     launched_pid: u32,
     launched_after: SystemTime,
 ) -> Result<(), ProcessGuardError> {
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::verify_listener_owner(port, launched_pid, launched_after)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (port, launched_pid, launched_after);
         Ok(())
@@ -1564,9 +1584,17 @@ fn verify_listener_executable_inner(
     port: u16,
     official_executable: &Path,
 ) -> Result<(), ProcessGuardError> {
-    verified_listener_snapshot(port, official_executable).map(drop)
+    #[cfg(target_os = "macos")]
+    {
+        macos::verified_listener_process(port, official_executable).map(drop)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        verified_listener_snapshot(port, official_executable).map(drop)
+    }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn verified_listener_snapshot(
     port: u16,
     official_executable: &Path,
@@ -1623,11 +1651,51 @@ pub(crate) struct AttachedProcess {
     created_at: SystemTime,
     #[cfg(windows)]
     handle: OwnedHandle,
+    #[cfg(target_os = "macos")]
+    observer: macos::ProcessObserver,
 }
 
 impl AttachedProcess {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn for_running_executable(executable: &Path) -> Result<Option<Self>, ProcessGuardError> {
+        macos::unique_running_identity(executable)?
+            .map(Self::from_macos_identity)
+            .transpose()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn verify_running(&self) -> Result<(), ProcessGuardError> {
+        self.observer.verify_running()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn for_launched(
+        pid: u32,
+        launched_after: SystemTime,
+        executable: &Path,
+    ) -> Result<Self, ProcessGuardError> {
+        Self::from_macos_identity(macos::verified_process_identity(pid, launched_after, executable)?)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn from_macos_identity(identity: macos::ProcessIdentity) -> Result<Self, ProcessGuardError> {
+        Ok(Self {
+            pid: identity.pid,
+            created_at: identity.created_at,
+            observer: macos::ProcessObserver::new(identity)?,
+        })
+    }
+
     pub(crate) fn for_listener(port: u16, executable: &Path) -> Result<Self, ProcessGuardError> {
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            let observer = Self::from_macos_identity(
+                macos::verified_listener_process(port, executable)?,
+            )?;
+            observer.verify_listener(port)?;
+            Ok(observer)
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
         { let _ = (port, executable); Err(ProcessGuardError::OwnershipUnknown) }
         #[cfg(windows)]
         {
@@ -1665,11 +1733,19 @@ impl AttachedProcess {
     pub(crate) fn created_ms(&self)->u64 { self.created_at.duration_since(UNIX_EPOCH).expect("verified creation time").as_millis() as u64 }
 
     pub(crate) fn verify_listener(&self, port: u16) -> Result<(), ProcessGuardError> {
-        self.running()?;
-        verify_listener_owner(port, self.pid, self.created_at)?;
-        self.running()
+        #[cfg(target_os = "macos")]
+        {
+            self.observer.verify_listener(port)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.running()?;
+            verify_listener_owner(port, self.pid, self.created_at)?;
+            self.running()
+        }
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn running(&self) -> Result<(), ProcessGuardError> {
         #[cfg(windows)]
         match process_handle_exit_code(&self.handle) {
@@ -1690,7 +1766,9 @@ impl AttachedProcess {
                 Err(e) => return Err(ProcessGuardError::ProcessInspectionUnknown.context("attached process wait",e)),
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        { self.observer.wait_for_exit().await }
+        #[cfg(not(any(windows, target_os = "macos")))]
         { Err(ProcessGuardError::ProcessInspectionUnknown) }
     }
 }
@@ -1715,7 +1793,11 @@ struct DebugListenerCandidates {
 pub fn discover_listener_port(
     official_executable: &Path,
 ) -> Result<Option<u16>, ProcessGuardError> {
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::discover_listener_port(official_executable)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = official_executable;
         Ok(None)
@@ -1814,8 +1896,20 @@ Invoke-CCStep 'serialize ownership snapshot' {{ [pscustomobject]@{{Listeners=$l;
     )
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn is_executable_running_except(
+    path: &Path,
+    excluded_pid: u32,
+) -> Result<bool, ProcessGuardError> {
+    macos::is_executable_running_except(path, excluded_pid)
+}
+
 pub fn is_executable_running(executable: &Path) -> Result<bool, ProcessGuardError> {
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::is_executable_running(executable)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = executable;
         Ok(false)
@@ -2155,6 +2249,209 @@ fn path_starts_with(candidate: &Path, root: &Path) -> bool {
         .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
         .collect();
     candidate.starts_with(&root)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Command};
+
+    struct ListenerChild(Child, u16);
+
+    impl ListenerChild {
+        fn spawn(address: &str, descendant: bool) -> (Self, SystemTime) {
+            Self::spawn_with_port(address, descendant, None)
+        }
+
+        fn spawn_with_port(
+            address: &str,
+            descendant: bool,
+            configured: Option<u16>,
+        ) -> (Self, SystemTime) {
+            let mut command = Command::new("/usr/bin/perl");
+            command.args([
+                "-MIO::Socket::INET", "-e",
+                r#"use strict; use warnings;
+                   $| = 1;
+                   my ($address, $descendant, $requested_port) = @ARGV;
+                   my $pid = $descendant ? fork() : 0;
+                   die $! unless defined $pid;
+                   if ($pid) { waitpid($pid, 0); exit 0; }
+                   my $socket = IO::Socket::INET->new(LocalAddr => $address, LocalPort => $requested_port,
+                       Proto => 'tcp', Listen => 1, ReuseAddr => 1) or die $!;
+                   my $port = $socket->sockport;
+                   print "$port\n";
+                   <STDIN>;"#,
+                address, if descendant { "1" } else { "0" },
+            ]).arg(configured.unwrap_or(0).to_string());
+            if let Some(port) = configured {
+                command.args([
+                    "--remote-debugging-address=127.0.0.1",
+                    &format!("--remote-debugging-port={port}"),
+                ]);
+            }
+            let started = SystemTime::now();
+            let mut child = Self(
+                command
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+                0,
+            );
+            let mut line = String::new();
+            BufReader::new(child.0.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            child.1 = line.trim().parse().unwrap();
+            (child, started)
+        }
+    }
+
+    impl Drop for ListenerChild {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn macos_process_identity_requires_exact_path_and_start_time() {
+        let (child, started) = ListenerChild::spawn("127.0.0.1", false);
+        let pid = child.0.id();
+        let perl = Path::new("/usr/bin/perl");
+        verify_process_identity(pid, started, perl).unwrap();
+        assert!(
+            verify_process_identity(pid, SystemTime::now() + Duration::from_secs(1), perl).is_err()
+        );
+        assert!(verify_process_identity(pid, started, Path::new("/bin/sleep")).is_err());
+    }
+
+    #[test]
+    fn macos_verifies_only_the_current_open_loopback_listener() {
+        let executable = env::current_exe().unwrap();
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        verify_listener_owner(port, std::process::id(), UNIX_EPOCH).unwrap();
+        verify_listener_executable(port, &executable).unwrap();
+        assert!(verify_listener_executable(port, Path::new("/bin/sleep")).is_err());
+        assert!(verify_listener_owner(port, u32::MAX, UNIX_EPOCH).is_err());
+        assert!(verify_listener_owner(0, std::process::id(), UNIX_EPOCH).is_err());
+        drop(socket);
+        assert!(verify_listener_owner(port, std::process::id(), UNIX_EPOCH).is_err());
+        assert!(verify_listener_executable(port, &executable).is_err());
+    }
+
+    #[test]
+    fn macos_launched_observer_can_be_pinned_before_a_listener_exists() {
+        let process = AttachedProcess::for_launched(
+            std::process::id(),
+            UNIX_EPOCH,
+            &env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        process
+            .verify_listener(listener.local_addr().unwrap().port())
+            .unwrap();
+        assert!(
+            AttachedProcess::for_launched(std::process::id(), UNIX_EPOCH, Path::new("/bin/sleep"),)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn macos_rejects_wildcard_listener_even_with_correct_owner() {
+        let socket = TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        assert!(verify_listener_owner(port, std::process::id(), UNIX_EPOCH).is_err());
+        assert!(verify_listener_executable(port, &env::current_exe().unwrap()).is_err());
+    }
+
+    #[test]
+    fn macos_distinguishes_exact_loopback_from_foreign_wildcard_on_same_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _wildcard = ListenerChild::spawn_with_port("0.0.0.0", false, Some(port)).0;
+        assert!(verify_listener_executable(port, &env::current_exe().unwrap()).is_ok());
+        assert!(verify_listener_executable(port, Path::new("/usr/bin/perl")).is_err());
+    }
+
+    #[test]
+    fn macos_rejects_listener_with_shared_file_description() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shared = listener.try_clone().unwrap();
+        assert!(verify_listener_owner(port, std::process::id(), UNIX_EPOCH).is_err());
+        drop(shared);
+        verify_listener_owner(port, std::process::id(), UNIX_EPOCH).unwrap();
+    }
+
+    #[test]
+    fn macos_listener_owner_accepts_a_contained_descendant() {
+        let (child, started) = ListenerChild::spawn("127.0.0.1", true);
+        verify_listener_owner(child.1, child.0.id(), started).unwrap();
+        verify_listener_executable(child.1, Path::new("/usr/bin/perl")).unwrap();
+        assert!(verify_listener_owner(child.1, std::process::id(), UNIX_EPOCH).is_err());
+    }
+
+    #[test]
+    fn macos_running_check_uses_the_exact_image() {
+        assert!(is_executable_running(&env::current_exe().unwrap()).unwrap());
+        assert!(is_executable_running(Path::new("/not/a/real/executable")).is_err());
+    }
+
+    #[test]
+    fn macos_discovery_requires_both_the_debug_switch_and_verified_socket() {
+        let (unconfigured, _) = ListenerChild::spawn("127.0.0.1", false);
+        let executable = Path::new("/usr/bin/perl");
+        assert_eq!(discover_listener_port(executable).unwrap(), None);
+        let reservation = PortReservation::reserve().unwrap();
+        let port = reservation.port().unwrap();
+        reservation.release();
+        let (configured, _) = ListenerChild::spawn_with_port("127.0.0.1", false, Some(port));
+        assert_eq!(
+            discover_listener_port(executable).unwrap(),
+            Some(configured.1)
+        );
+        drop(unconfigured);
+    }
+
+    #[tokio::test]
+    async fn macos_attached_observer_drops_without_signaling_and_stops_at_exit() {
+        let (mut child, _) = ListenerChild::spawn("127.0.0.1", false);
+        let executable = Path::new("/usr/bin/perl");
+        let observer = AttachedProcess::for_listener(child.1, executable).unwrap();
+        assert_eq!(observer.pid(), child.0.id());
+        drop(observer);
+        assert!(child.0.try_wait().unwrap().is_none());
+        let observer = AttachedProcess::for_listener(child.1, executable).unwrap();
+        drop(child.0.stdin.take());
+        assert!(child.0.wait().unwrap().success());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), observer.wait_for_exit())
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let replacement = TcpListener::bind(("127.0.0.1", child.1)).unwrap();
+        assert!(
+            observer
+                .verify_listener(replacement.local_addr().unwrap().port())
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn macos_launched_guard_can_terminate_its_own_child() {
+        let mut command = TokioCommand::new("/bin/sleep");
+        command.arg("30");
+        let mut child = CodexChildGuard::spawn(command).unwrap();
+        child.terminate().await;
+        assert!(child.has_exited());
+    }
 }
 
 #[cfg(test)]
@@ -2579,7 +2876,11 @@ pub fn verify_listener_owner_fast(
     pid: u32,
     launched_after: SystemTime,
 ) -> Result<(), ProcessGuardError> {
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        verify_listener_owner(port, pid, launched_after)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (port, pid, launched_after);
         Ok(())

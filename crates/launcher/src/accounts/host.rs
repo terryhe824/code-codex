@@ -96,7 +96,8 @@ pub async fn verify_profile(endpoint:CdpEndpoint)->Result<()> {
 }
 pub(crate) fn discover_modules()->Result<Value>{
  let install=crate::discovery::discover_codex(None,None,crate::discovery::ChannelPreference::Stable).map_err(|_|AccountError::new("ACCOUNT_HOST","The official Codex host could not be located."))?;
- let mut file=std::fs::File::open(install.executable.parent().ok_or_else(||AccountError::protocol("Invalid host installation."))?.join("resources/app.asar")).map_err(|_|AccountError::protocol("The host bundle cannot be inspected."))?;
+ let bundle=crate::bootstrap::app_asar_path(&install.executable).ok_or_else(||AccountError::protocol("Invalid host installation."))?;
+ let mut file=std::fs::File::open(&bundle).map_err(|_|AccountError::protocol("The host bundle cannot be inspected."))?;
  let mut bytes=[0u8;16];file.read_exact(&mut bytes).map_err(|_|AccountError::protocol("Invalid host bundle header."))?;
  let header_size=u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as u64;
  let json_size=u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
@@ -118,7 +119,7 @@ pub(crate) fn discover_modules()->Result<Value>{
   let mut data=vec![0u8;size as usize];file.read_exact(&mut data).map_err(|_|AccountError::protocol("Incomplete official module."))?;
   fingerprints.insert(name.clone(),json!(format!("{:x}",Sha256::digest(&data))));role.push(format!("./assets/{name}"));
  }
- Ok(json!({"version":install.version,"initial":initial,"shared":shared,"appearance":appearance,"actions":actions,"fingerprints":fingerprints,"runtimes":crate::bootstrap::read_numbered_host_runtimes(&install.executable.parent().unwrap().join("resources/app.asar")).map_err(|stage|AccountError::new("ACCOUNT_HOST_UNSUPPORTED",format!("Official runtime inventory failed. stage={stage}; accountStateLoaded=false; no task was sent.")))?}))
+ Ok(json!({"version":install.version,"initial":initial,"shared":shared,"appearance":appearance,"actions":actions,"fingerprints":fingerprints,"runtimes":crate::bootstrap::read_numbered_host_runtimes(&bundle).map_err(|stage|AccountError::new("ACCOUNT_HOST_UNSUPPORTED",format!("Official runtime inventory failed. stage={stage}; accountStateLoaded=false; no task was sent.")))?}))
 }
 
 pub async fn observe(endpoint: CdpEndpoint) -> Result<Owner> {

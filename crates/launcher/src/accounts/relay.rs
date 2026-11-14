@@ -48,6 +48,7 @@ pub(super) struct Route {
     quota: Mutex<Option<Value>>,
     selection: std::sync::RwLock<Arc<Credential>>,
     client: reqwest::Client,
+    loopback: reqwest::Client,
     key: String,
     authority: String,
     shared: Option<Weak<SharedRelay>>,
@@ -146,7 +147,7 @@ impl Routes {
                 shared
             }
         };
-        let route = Route::new(owner, thread, credential, upstream, shared.client.clone(), shared.authority.clone(), super::nonce(), Some(Arc::downgrade(&shared)));
+        let route = Route::new(owner, thread, credential, upstream, shared.client.clone(), shared.authority.clone(), super::nonce(), Some(Arc::downgrade(&shared)))?;
         shared.routes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(route.key.clone(), Arc::downgrade(&route));
         Ok(route)
     }
@@ -274,7 +275,7 @@ impl Route {
         // bypass works, without changing global proxy or authentication state.
         // Keep the listener on IPv4 loopback and validate the exact Host below.
         let authority = format!("localhost:{}", address.port());
-        let route = Self::new(owner, thread, credential, upstream, client, authority, super::nonce(), None);
+        let route = Self::new(owner, thread, credential, upstream, client, authority, super::nonce(), None)?;
         crate::runtime_log::record("accounts","account.relay.lifecycle","listening",json!({"routeId":route.route_id,"localPort":address.port(),"loopbackHost":"localhost","listenerFamily":"ipv4","conversationId":route.thread(),"connectionId":route.connection(),"committed":false,"network":crate::network_diagnostics::environment(),"taskSent":false}));
         let weak = Arc::downgrade(&route);
         let cancel = route.cancel.clone();
@@ -285,8 +286,13 @@ impl Route {
         });
         Ok(route)
     }
-    fn new(owner:String, thread:String, credential:Arc<Credential>, upstream:String, client:reqwest::Client, authority:String, key:String, shared:Option<Weak<SharedRelay>>) -> Arc<Self> {
-        Arc::new(Self {
+    fn new(owner:String, thread:String, credential:Arc<Credential>, upstream:String, client:reqwest::Client, authority:String, key:String, shared:Option<Weak<SharedRelay>>) -> Result<Arc<Self>> {
+        let loopback = super::api::loopback_client(reqwest::Client::builder())
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|_| fault("loopback-client"))?;
+        Ok(Arc::new(Self {
             owner,
             thread: std::sync::RwLock::new(thread),
             base_url: format!("http://{authority}/{key}"),
@@ -299,6 +305,7 @@ impl Route {
             quota: Mutex::new(None),
             selection: std::sync::RwLock::new(credential),
             client,
+            loopback,
             upstream,
             route_id: ROUTE_SEQUENCE.fetch_add(1,Ordering::Relaxed),
             requests: AtomicUsize::new(0),
@@ -308,7 +315,7 @@ impl Route {
             handoff_generation: AtomicUsize::new(0),
             handoff_status: Mutex::new(None),
             lazy_handoff: Mutex::new(None),
-        })
+        }))
     }
     pub fn expire_uncommitted(&self){let thread=self.thread.read().unwrap_or_else(std::sync::PoisonError::into_inner);if thread.starts_with("draft-")&&!self.ready.load(Ordering::Acquire){drop(thread);self.close();}}
     pub fn thread(&self)->String {self.thread.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()}
@@ -393,8 +400,9 @@ impl Route {
         json!({"connectionId":self.connection(),"routed":true,"ready":self.ready.load(Ordering::Acquire)&&!self.cancel.is_cancelled(),"activeRequests":self.active.load(Ordering::Relaxed),"quota":self.quota.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),"diagnostics":{"routeId":self.route_id,"localPort":self.authority.rsplit(':').next().and_then(|p|p.parse::<u16>().ok()),"loopbackHost":"localhost","requests":self.requests.load(Ordering::Relaxed),"localHttpProbe":probe,"contextHandoff":self.handoff_status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),"lastFailure":self.last_failure.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()}})
     }
     /// A bounded local round trip, with no credentials, prompt or upstream call.
-    /// A direct check separates a dead listener from the configured proxy path.
-    /// This verifies the native relay client's HTTP path, not model availability.
+    /// Challenge our local relay before enabling a route. On Windows, the
+    /// configured HTTP path is also inspected because the native carrier may
+    /// use it. On macOS this client always sends local traffic directly.
     pub async fn probe(&self, force: bool) -> Result<()> {
         if self.shared.is_some() && self.cancel.is_cancelled() { return Err(fault("route-closed")); }
         let shared = self.shared.as_ref().and_then(Weak::upgrade);
@@ -406,8 +414,11 @@ impl Route {
             return Ok(());
         }
         let mut operation = crate::runtime_log::Operation::start("accounts", "account.relay.probe", json!({"routeId":self.route_id,"localPort":self.authority.rsplit(':').next(),"loopbackHost":"localhost","stage":"local-http-probe","upstreamAttempted":false,"taskSent":false}));
-        let direct = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().map_err(|_| fault("probe-client"))?;
-        for (stage, client) in [("direct-loopback", &direct), ("configured-http-path", &self.client)] {
+        #[cfg(target_os = "macos")]
+        let stages = [("direct-loopback", &self.loopback)];
+        #[cfg(not(target_os = "macos"))]
+        let stages = [("direct-loopback", &self.loopback), ("configured-http-path", &self.client)];
+        for (stage, client) in stages {
             let challenge = super::nonce();
             let response = client.get(format!("{}/health", self.base_url)).header("x-code-codex-route-probe", &challenge).timeout(Duration::from_secs(3)).send().await;
             let (status, valid, network) = match response {
@@ -556,13 +567,11 @@ impl Route {
             return reject(&mut io,426,"ACCOUNT_API_HTTP_REQUIRED: This Responses connection uses HTTP streaming. Re-select it before sending.").await;
         }
         let headers = if api.is_some(){api_headers(&request.headers,&auth)?}else{upstream_headers(&request.headers, &auth)?};
-        let mut builder = self
-            .client
-            .request(
-                request.method.clone(),
-                format!("{}{}", api.map(|s|s.base_url.as_str()).unwrap_or(&self.upstream), request.path),
-            )
-            .headers(headers);
+        let target = reqwest::Url::parse(&format!(
+            "{}{}", api.map(|settings| settings.base_url.as_str()).unwrap_or(&self.upstream), request.path
+        )).map_err(|_| fault("upstream-url"))?;
+        let transport = super::api::transport_for(&self.client, &self.loopback, &target);
+        let mut builder = transport.request(request.method.clone(), target).headers(headers);
         let mut bootstrap_ticket=None;let mut context_input=None;
         if request.length > 0 {
             operation.event("account.relay.phase","observed",json!({"stage":"request-body","expectedBytes":request.length}));
@@ -1428,6 +1437,55 @@ mod tests {
         assert!(error.message.contains("directReachable=false"));
         assert!(!error.message.contains(&route.key));
     }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_literal_loopback_api_credentials_never_reach_the_proxy() {
+        let api = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_address = api.local_addr().unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let api_request = tokio::spawn(async move {
+            let (socket, _) = api.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let header = read_header(&mut socket).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+            header
+        });
+        let proxy_request = tokio::spawn(async move {
+            let (socket, _) = proxy.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let header = read_header(&mut socket).await.unwrap();
+            socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            header
+        });
+        let configured = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy_address}")).unwrap())
+            .redirect(reqwest::redirect::Policy::none())
+            .build().unwrap();
+        let settings = super::super::api::Settings::parse(&format!("http://{api_address}/v1"), "fixture").unwrap();
+        let credential = Route::prepare_api("fixture".into(), settings, "synthetic-loopback-key".into()).unwrap();
+        let route = Route::listen("owner".into(), "thread".into(), credential, UPSTREAM.into(), configured.clone()).await.unwrap();
+        route.ready.store(true, Ordering::Release);
+        let direct = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = direct.post(format!("{}/responses", route.base_url))
+            .json(&json!({"input":[]})).timeout(Duration::from_secs(3)).send().await.unwrap();
+        assert_eq!(response.status(), 200, "a loopback API request must never go through the proxy");
+        let received = tokio::time::timeout(Duration::from_secs(3), api_request).await.unwrap().unwrap();
+        assert!(received.starts_with("POST /v1/responses "));
+        assert!(received.contains("authorization: Bearer synthetic-loopback-key"));
+
+        let external = super::super::api::Settings::parse("https://external-routing-fixture.invalid/v1", "fixture").unwrap();
+        route.commit_credential(Route::prepare_api("external".into(), external, "synthetic-external-key".into()).unwrap());
+        let external_response = direct.post(format!("{}/responses", route.base_url))
+            .json(&json!({"input":[]})).timeout(Duration::from_secs(3)).send().await.unwrap();
+        assert_eq!(external_response.status(), 502, "the fixture proxy rejected the HTTPS CONNECT");
+        let intercepted = tokio::time::timeout(Duration::from_secs(3), proxy_request).await.unwrap().unwrap();
+        assert!(intercepted.starts_with("CONNECT external-routing-fixture.invalid:443 "));
+        assert!(!intercepted.contains("synthetic-loopback-key"));
+        route.close();
+    }
+
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn configured_http_proxy_cannot_impersonate_a_ready_local_listener() {
         let proxy = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -1664,7 +1722,7 @@ mod tests {
     async fn context_trace_joins_identity_and_item_without_private_values() {
         crate::runtime_log::capture_test_events();
         let route = Route::new("owner".into(),"thread".into(),credential("host"),"http://fixture".into(),
-            reqwest::Client::builder().no_proxy().build().unwrap(),"localhost:1".into(),"fixture".into(),None);
+            reqwest::Client::builder().no_proxy().build().unwrap(),"localhost:1".into(),"fixture".into(),None).unwrap();
         let selection = route.selection.read().unwrap().clone();
         let identity = json!({"workspaceFingerprint":super::super::relay_diagnostics::fingerprint("PRIVATE_WORKSPACE")});
         let operation = crate::runtime_log::Operation::start("accounts","fixture",json!({}));
@@ -1683,7 +1741,7 @@ mod tests {
     #[tokio::test]
     async fn rejection_observation_keeps_operation_and_sampling_beyond_trace_samples() {
         crate::runtime_log::capture_test_events();
-        let route=Route::new("owner".into(),"thread".into(),credential("host"),"http://fixture".into(),reqwest::Client::builder().no_proxy().build().unwrap(),"localhost:1".into(),"fixture".into(),None);
+        let route=Route::new("owner".into(),"thread".into(),credential("host"),"http://fixture".into(),reqwest::Client::builder().no_proxy().build().unwrap(),"localhost:1".into(),"fixture".into(),None).unwrap();
         let selection=route.selection.read().unwrap().clone();
         let operation=crate::runtime_log::Operation::start("accounts","fixture",json!({}));
         let id="rs_0123456789abcdef";

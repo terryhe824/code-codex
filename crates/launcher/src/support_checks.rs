@@ -1,15 +1,19 @@
 //! Bounded read-only support checks. No resets, cache deletion or security-policy changes.
 use serde_json::{Value, json};
-use std::{
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{sync::Mutex, time::Duration};
+#[cfg(windows)]
+use std::time::Instant;
+#[cfg(any(windows, test))]
 use tokio::io::AsyncReadExt;
 static SYSTEM: Mutex<Option<Value>> = Mutex::new(None);
 static CHECK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub(crate) fn environment() -> Value {
-    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pointerBits":usize::BITS,"localDataConfigured":std::env::var_os("LOCALAPPDATA").is_some(),"network":crate::network_diagnostics::environment(),"limits":{"runs":10,"runBytes":5*1024*1024,"systemQueryMs":6000,"queryCaptureBytes":32768},"unobservable":["official internal initialization","original connection DNS/TCP/TLS phase timings","full crash dump","security software private policy","kernel packet trace"],"readOnly":true})
+    #[cfg(target_os = "macos")]
+    let local_data_configured = workspace_service::application_paths::data_root().is_ok();
+    #[cfg(not(target_os = "macos"))]
+    let local_data_configured = std::env::var_os("LOCALAPPDATA").is_some();
+    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"pointerBits":usize::BITS,"localDataConfigured":local_data_configured,"network":crate::network_diagnostics::environment(),"limits":{"runs":10,"runBytes":5*1024*1024,"systemQueryMs":6000,"queryCaptureBytes":32768},"unobservable":["official internal initialization","original connection DNS/TCP/TLS phase timings","full crash dump","security software private policy","kernel packet trace"],"readOnly":true})
 }
 
 pub(crate) fn report() -> String {
@@ -20,6 +24,7 @@ pub(crate) fn report() -> String {
     )
 }
 
+#[cfg(any(windows, test))]
 async fn capture(mut reader: impl tokio::io::AsyncRead + Unpin) -> Value {
     let mut buffer = [0u8; 4096];
     let mut kept = Vec::new();
@@ -114,7 +119,46 @@ async fn system_query() -> Value {
     }
     json!({"status":if status["success"]==true && parsed.is_some(){"observed"}else{"unavailable"},"durationMs":started.elapsed().as_millis(),"process":status,"stdout":stdout,"stderr":stderr,"checks":parsed,"steps":steps,"interpretation":"Independent recent system evidence; absence of a matching event does not prove no crash or security interception."})
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+async fn system_query() -> Value {
+    let Ok(exe) = std::env::current_exe() else {
+        return json!({"status":"unavailable","reason":"Could not locate the running Code-Codex executable."});
+    };
+    let bundle = exe.parent().and_then(macos_bundle_root);
+    let target = bundle.unwrap_or(&exe);
+    let mut command = tokio::process::Command::new("/usr/bin/codesign");
+    command
+        .args(["--verify", "--strict"])
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let result = tokio::time::timeout(Duration::from_secs(6), command.status()).await;
+    let signature = match result {
+        Ok(Ok(status)) => {
+            json!({"status":if status.success() { "valid" } else { "unverified" }, "exitCode":status.code()})
+        }
+        Ok(Err(error)) => json!({"status":"unavailable","osCode":error.raw_os_error()}),
+        Err(_) => json!({"status":"unavailable","reason":"signature query timed out"}),
+    };
+    let scope = if bundle.is_some() {
+        "Code-Codex application bundle"
+    } else {
+        "Code-Codex executable"
+    };
+    json!({
+        "status":if signature["status"] == "unavailable" { "unavailable" } else { "observed" },
+        "checks":{
+            "signature":{"scope":scope,"integrity":signature,"identityAndNotarization":"not checked"},
+            "launch":{"status":"observed","scope":"current Code-Codex process only"},
+            "crash":{"status":"not collected","reason":"macOS crash reports are not queried"},
+            "windowsEventLogAndDefender":{"status":"not applicable"}
+        }
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 async fn system_query() -> Value {
     json!({"status":"unsupported","reason":"Windows event and Defender checks are unavailable on this OS."})
 }
@@ -157,6 +201,27 @@ pub(crate) async fn run_with_progress(mut progress: impl FnMut(&str, &str, &Valu
     json!({"status":"completed","environment":environment,"local":local,"system":system})
 }
 
+#[cfg(target_os = "macos")]
+fn macos_bundle_root(root: &std::path::Path) -> Option<&std::path::Path> {
+    let contents = root.parent()?;
+    let bundle = contents.parent()?;
+    (root.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.extension()?.eq_ignore_ascii_case("app"))
+    .then_some(bundle)
+}
+
+#[cfg(target_os = "macos")]
+fn component_paths(root: &std::path::Path) -> [(&'static str, std::path::PathBuf); 2] {
+    let names = if macos_bundle_root(root).is_some() {
+        ["code-codex-core", "Code-Codex"]
+    } else {
+        ["code-codex", "code-codex-launcher"]
+    };
+    names.map(|name| (name, root.join(name)))
+}
+
+#[cfg(not(target_os = "macos"))]
 fn component_paths(root: &std::path::Path) -> [(&'static str, std::path::PathBuf); 5] {
     let installed = root
         .parent()
@@ -234,6 +299,37 @@ fn local_checks() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_component_locations_match_bundle_and_development_names() {
+        let bundled = std::path::Path::new("/Applications/Localized 工具.app/Contents/MacOS");
+        let dev = std::path::Path::new("/workspace/target/debug");
+        for (root, expected) in [
+            (bundled, ["code-codex-core", "Code-Codex"]),
+            (dev, ["code-codex", "code-codex-launcher"]),
+        ] {
+            let mapped = component_paths(root);
+            assert_eq!(mapped.len(), expected.len());
+            for ((name, path), expected) in mapped.iter().zip(expected) {
+                assert_eq!(*name, expected);
+                assert_eq!(*path, root.join(expected));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_system_evidence_marks_windows_and_uncollected_checks() {
+        let evidence = system_query().await;
+        let checks = &evidence["checks"];
+        assert_eq!(checks["windowsEventLogAndDefender"]["status"], "not applicable");
+        assert_eq!(checks["crash"]["status"], "not collected");
+        assert_eq!(checks["signature"]["scope"], "Code-Codex executable");
+        assert_eq!(checks["signature"]["identityAndNotarization"], "not checked");
+        assert!(!evidence.to_string().contains(std::env::current_exe().expect("test executable").to_str().expect("path")));
+    }
+
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn component_locations_find_versioned_root_launcher() {
         let temp = tempfile::tempdir().unwrap();
@@ -243,6 +339,7 @@ mod tests {
         std::fs::write(&shim, b"fixture").unwrap();
         assert_eq!(component_paths(&version)[2].1, shim);
     }
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn component_locations_match_staging_and_installed_layouts() {
         let staging = std::path::Path::new("payload");

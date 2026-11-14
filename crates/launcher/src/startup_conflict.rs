@@ -1,4 +1,7 @@
 //! Explicit user consent for gracefully replacing an existing official desktop.
+#[cfg(target_os = "macos")]
+#[path = "startup_conflict_macos.rs"]
+pub(crate) mod macos;
 use std::path::Path;
 
 #[cfg(windows)]
@@ -16,7 +19,14 @@ pub(crate) fn window_operation(
 ) -> std::process::ExitCode {
     #[cfg(windows)]
     let result = windows::operate(pid, created_ms, image, close);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let result = if close {
+        Err("Use the confirmed Code-Codex restart action to close the application".into())
+    } else {
+        macos::target_from_cli(pid, created_ms, image)
+            .and_then(|target| macos::operate(&target, image, false))
+    };
+    #[cfg(not(any(windows, target_os = "macos")))]
     let result: Result<serde_json::Value, String> = {
         let _ = (pid, created_ms, image, close);
         Err("Native startup recovery requires Windows".into())
@@ -53,24 +63,46 @@ fn parse_worker_reply(reply: &str, reset: bool) -> Result<Outcome, String> {
 }
 
 pub(crate) async fn resolve(executable: &Path) -> Result<Outcome, String> {
-    let _directory = crate::startup_recovery_ui::begin()?;
-    let executable = executable.to_owned();
-    let result = tokio::task::spawn_blocking(move || invoke(Some(&executable), false))
-        .await
-        .map_err(|_| "Startup recovery worker failed".to_owned())?;
-    if matches!(result, Ok(Outcome::Cancelled)) { crate::startup_recovery_ui::cancelled(); }
-    result
+    #[cfg(target_os = "macos")]
+    {
+        macos::resolve(executable).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _directory = crate::startup_recovery_ui::begin()?;
+        let executable = executable.to_owned();
+        let result = tokio::task::spawn_blocking(move || invoke(Some(&executable), false))
+            .await
+            .map_err(|_| "Startup recovery worker failed".to_owned())?;
+        if matches!(result, Ok(Outcome::Cancelled)) {
+            crate::startup_recovery_ui::cancelled();
+        }
+        result
+    }
 }
 
 pub(crate) fn reset() -> Result<(), String> {
-    match invoke(None, true)? {
-        Outcome::Ready => Ok(()),
-        _ => {
-            Err("Automatic restart permission was not cleared; retry when recovery is idle".into())
+    #[cfg(target_os = "macos")]
+    {
+        macos::reset()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        match invoke(None, true)? {
+            Outcome::Ready => Ok(()),
+            _ => Err(
+                "Automatic restart permission was not cleared; retry when recovery is idle".into(),
+            ),
         }
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_user_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    macos::user_lock(path)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn invoke(executable: Option<&Path>, reset: bool) -> Result<Outcome, String> {
     #[cfg(not(windows))]
     {
@@ -90,8 +122,11 @@ fn invoke(executable: Option<&Path>, reset: bool) -> Result<Outcome, String> {
         let store = workspace_service::SettingsStore::for_current_user()
             .map_err(|e| format!("Startup recovery preference location: {e}"))?;
         let path = store.path().with_file_name("startup-recovery.json");
-        let source = crate::gui_support::localization::dialog_script(&format!("{}\n{}",
-            include_str!("startup_dialog.ps1"), include_str!("startup_conflict.ps1")));
+        let source = crate::gui_support::localization::dialog_script(&format!(
+            "{}\n{}",
+            include_str!("startup_dialog.ps1"),
+            include_str!("startup_conflict.ps1")
+        ));
         // Keep the encoded bootstrap short. Feed the embedded source through stdin
         // so translated dialogs cannot exceed Windows' command-line length limit.
         let bytes: Vec<u8> = SCRIPT_READER
@@ -114,8 +149,11 @@ fn invoke(executable: Option<&Path>, reset: bool) -> Result<Outcome, String> {
         if !reset {
             // begin() validated and initialized this per-launch channel. The
             // worker retains its original candidate handle while awaiting consent.
-            command.env(crate::startup_recovery_ui::CHANNEL_ENV, crate::startup_recovery_ui::directory()
-                .ok_or("Startup UI channel was lost; no close requested")?);
+            command.env(
+                crate::startup_recovery_ui::CHANNEL_ENV,
+                crate::startup_recovery_ui::directory()
+                    .ok_or("Startup UI channel was lost; no close requested")?,
+            );
         }
         let mut child = command
             .spawn()
@@ -184,4 +222,10 @@ mod tests {
 }
 
 #[cfg(windows)]
-pub(crate) fn close_for_restart(pid:u32,created_ms:u64,image:&Path)->Result<serde_json::Value,String>{windows::operate(pid,created_ms,image,true)}
+pub(crate) fn close_for_restart(
+    pid: u32,
+    created_ms: u64,
+    image: &Path,
+) -> Result<serde_json::Value, String> {
+    windows::operate(pid, created_ms, image, true)
+}

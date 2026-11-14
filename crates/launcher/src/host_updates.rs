@@ -381,7 +381,7 @@ fn run_owned(
             return Ok(value);
         }
     };
-    if install.source != crate::discovery::DiscoverySource::WindowsPackageManager {
+    if !matches!(install.source, crate::discovery::DiscoverySource::WindowsPackageManager | crate::discovery::DiscoverySource::MacApplication) {
         return Err(io::Error::other(
             "HOST_UPDATE_SOURCE: Only the verified official package may be inventoried.",
         ));

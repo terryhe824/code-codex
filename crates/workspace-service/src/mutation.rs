@@ -1759,6 +1759,56 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn macos_import_commit_respects_the_actual_destination_case_semantics() {
+        let (directory, workspace) = fixture();
+        fs::write(directory.path().join("CaseProbe"), b"x").expect("case probe");
+        let case_sensitive = !directory.path().join("caseprobe").exists();
+        fs::remove_file(directory.path().join("CaseProbe")).expect("remove probe");
+
+        let prepare = |name, nonce, bytes: &[u8]| {
+            let mut session = workspace
+                .begin_import(
+                    "",
+                    name,
+                    CreateEntryKind::File,
+                    Some(bytes.len() as u64),
+                    nonce,
+                )
+                .expect("begin while destination is empty");
+            session
+                .append_chunk(0, bytes)
+                .expect("append fixture bytes");
+            session.finish_file().expect("finish fixture bytes");
+            session
+        };
+        let upper = prepare("Name.txt", "upper", b"first");
+        let lower = prepare("name.txt", "lower", b"second");
+        let duplicate = prepare("Name.txt", "duplicate", b"third");
+        upper.commit().expect("commit first root");
+        assert_eq!(
+            duplicate.commit().expect_err("same name conflicts").code(),
+            crate::ErrorCode::Conflict
+        );
+        if case_sensitive {
+            lower.commit().expect("case-distinct name");
+            assert_eq!(
+                fs::read(directory.path().join("name.txt")).expect("second name"),
+                b"second"
+            );
+        } else {
+            assert_eq!(
+                lower.commit().expect_err("case alias conflicts").code(),
+                crate::ErrorCode::Conflict
+            );
+        }
+        assert_eq!(
+            fs::read(directory.path().join("Name.txt")).expect("first name"),
+            b"first"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn macos_case_only_directory_rename_preserves_its_contents() {
         let (directory, workspace) = fixture();
         fs::create_dir(directory.path().join("目录É")).expect("source directory");

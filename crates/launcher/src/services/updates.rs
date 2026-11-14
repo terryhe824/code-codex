@@ -89,14 +89,32 @@ pub(super) struct UpdateInstallResult {
 
 impl UpdateChecker {
     pub(super) fn github() -> Self {
+        #[cfg(target_os = "macos")]
+        return Self {
+            startup_result: Mutex::new(None),
+            client: Err(crate::update_contract::macos_release_feed_unavailable()),
+            download_client: Err(crate::update_contract::macos_release_feed_unavailable()),
+            endpoint: String::new(),
+        };
+        #[cfg(not(target_os = "macos"))]
         Self::new(GITHUB_LATEST_RELEASE_ENDPOINT)
     }
 
     pub(super) fn new(endpoint: impl Into<String>) -> Self {
+        let endpoint = endpoint.into();
         let client = reqwest::Client::builder()
             .connect_timeout(UPDATE_CONNECT_TIMEOUT)
             .timeout(UPDATE_REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::none());
+        #[cfg(test)]
+        let client = if url::Url::parse(&endpoint)
+            .is_ok_and(|url| url.host_str() == Some("127.0.0.1"))
+        {
+            client.no_proxy()
+        } else {
+            client
+        };
+        let client = client
             .build()
             .inspect_err(|e| {
                 crate::runtime_log::record(
@@ -133,7 +151,7 @@ impl UpdateChecker {
             startup_result: Mutex::new(None),
             client,
             download_client,
-            endpoint: endpoint.into(),
+            endpoint,
         }
     }
 
@@ -169,6 +187,10 @@ impl UpdateChecker {
         &self,
         current_version: &str,
     ) -> Result<GithubLatestRelease, BridgeError> {
+        #[cfg(target_os = "macos")]
+        if self.endpoint.is_empty() {
+            return Err(crate::update_contract::macos_release_feed_unavailable());
+        }
         let mut trace = crate::network_diagnostics::HttpTrace::start(
             "update",
             &self.endpoint,
@@ -557,6 +579,19 @@ pub(super) fn update_unavailable_error() -> BridgeError {
         "UPDATE_CHECK_UNAVAILABLE",
         "GitHub could not be reached. Check your connection and try again.",
     )
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mac_installation_product_online_updates_stop_before_any_network() {
+        let checker = UpdateChecker::github();
+        assert!(checker.endpoint.is_empty() && checker.download_client.is_err());
+        assert_eq!(checker.check("0.6.20").await.unwrap_err().code, "UPDATE_MACOS_FEED_UNAVAILABLE");
+        assert_eq!(checker.check_startup("0.6.20").await.unwrap_err().code, "UPDATE_MACOS_FEED_UNAVAILABLE");
+    }
 }
 
 pub(super) fn update_invalid_response_error() -> BridgeError {

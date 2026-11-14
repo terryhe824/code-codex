@@ -21,9 +21,12 @@ pub(super) fn parse(value: &Value) -> Result<Vec<String>> {
     Ok(ids)
 }
 async fn fetch(settings: &api::Settings, key: &str) -> Result<Vec<String>> {
-    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+    let target = reqwest::Url::parse(&format!("{}/models", settings.base_url))
+        .map_err(|_| failure("target"))?;
+    let client = api::for_http_target(reqwest::Client::builder(), &target)
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10)).build().map_err(|_| failure("client"))?;
-    let mut response = client.get(format!("{}/models", settings.base_url))
+    let mut response = client.get(target)
         .header("user-agent", "codex_cli_rs").header("originator", "codex_cli_rs")
         .bearer_auth(key).send().await.map_err(|_| failure("network"))?;
     if !response.status().is_success() {
@@ -130,14 +133,13 @@ mod tests {
     }
     #[tokio::test]
     async fn fetch_sends_native_client_headers_and_only_its_api_key() {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
             let mut bytes = Vec::new(); let mut part = [0u8; 1024];
-            while !bytes.ends_with(b"\r\n\r\n") { let n = socket.read(&mut part).unwrap(); assert!(n > 0); bytes.extend_from_slice(&part[..n]); }
+            while !bytes.ends_with(b"\r\n\r\n") { let n = socket.read(&mut part).await.unwrap(); assert!(n > 0); bytes.extend_from_slice(&part[..n]); }
             let request = String::from_utf8(bytes).unwrap().to_lowercase();
             assert!(request.starts_with("get /v1/models http/1.1\r\n"));
             assert!(request.contains("\r\nuser-agent: codex_cli_rs\r\n"));
@@ -145,10 +147,11 @@ mod tests {
             assert!(request.contains("\r\nauthorization: bearer synthetic-key\r\n"));
             assert!(!request.contains("chatgpt-account-id") && !request.contains("cookie:"));
             let body = r#"{"data":[{"id":"vendor/model"}]}"#;
-            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            socket.write_all(response.as_bytes()).await.unwrap();
         });
         let settings = api::Settings::parse(&format!("http://{address}/v1"), "configured").unwrap();
         assert_eq!(fetch(&settings, "synthetic-key").await.unwrap(), vec!["vendor/model"]);
-        server.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server).await.unwrap().unwrap();
     }
 }

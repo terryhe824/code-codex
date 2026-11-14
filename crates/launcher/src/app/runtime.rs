@@ -91,7 +91,12 @@ pub(super) async fn run(args: RunArgs) -> Result<(), AppError> {
     }
     record_startup_event("existing process", "checking for conflicting Codex process");
     if is_executable_running(&installation.executable)? {
-        if installation.source != DiscoverySource::WindowsPackageManager {
+        #[cfg(target_os = "macos")]
+        if args.login_startup {
+            record_startup_event("existing process", "login launch skipped; existing Codex preserved");
+            return Ok(());
+        }
+        if !trusted_app_source(installation.source) {
             return Err(AppError::AlreadyRunning);
         }
         record_startup_event("existing process", "offering consent-based graceful restart");
@@ -294,6 +299,12 @@ pub(super) async fn run(args: RunArgs) -> Result<(), AppError> {
             kind: error.kind(),
         })?
     };
+    #[cfg(target_os = "macos")]
+    let pinned_process = Arc::new(AttachedProcess::for_launched(
+        child.pid(),
+        launched_after,
+        &installation.executable,
+    )?);
     if startup_enabled && early_player.is_none() {
         early_player = Some(early_startup::start(endpoint, child.pid(), launched_after));
     }
@@ -355,18 +366,21 @@ pub(super) async fn run(args: RunArgs) -> Result<(), AppError> {
         tracing::info!(event = "cdp_owner_verified");
         record_listener_verified();
         record_startup_event("listener ownership", "verified against launched process");
+        #[cfg(target_os = "macos")]
+        pinned_process.verify_listener(port)?;
         if !bridge.bind_verified_window_process(launched_pid) {
             tracing::warn!(event = "codex_window_process_binding_failed");
         }
         let cancellation = CancellationToken::new();
+        #[cfg(target_os = "macos")]
+        let listener_identity = ListenerIdentity::AttachedProcess(pinned_process.clone());
+        #[cfg(not(target_os = "macos"))]
+        let listener_identity = ListenerIdentity::LaunchedProcess { pid: launched_pid, launched_after };
         let supervisor = supervise(
             endpoint,
             bridge,
             injection,
-            ListenerIdentity::LaunchedProcess {
-                pid: launched_pid,
-                launched_after,
-            },
+            listener_identity,
             false,
             IdlePolicy::RecoverUntilCancelled,
             cancellation.clone(),
@@ -515,7 +529,7 @@ pub(super) async fn attach(args: AttachArgs) -> Result<(), AppError> {
     };
     let installation = discover_codex(None, None, preference)?;
     record_startup_event("discovery", "installation found");
-    if installation.source != DiscoverySource::WindowsPackageManager {
+    if !trusted_app_source(installation.source) {
         runtime_log::record(
             "launcher",
             "live activation",
@@ -534,6 +548,8 @@ pub(super) async fn attach(args: AttachArgs) -> Result<(), AppError> {
     let endpoint = CdpEndpoint::loopback(args.port);
     record_renderer_port(args.port);
     record_startup_event("listener ownership", "verifying official executable");
+    #[cfg(target_os = "macos")]
+    let pinned_process = Arc::new(AttachedProcess::for_listener(args.port, &installation.executable)?);
     let executable = installation.executable.clone();
     tokio::task::spawn_blocking(move || verify_listener_executable(args.port, &executable))
         .await
@@ -569,11 +585,15 @@ pub(super) async fn attach(args: AttachArgs) -> Result<(), AppError> {
         })??;
     tracing::info!(event = "authorized_cdp_attach");
     record_startup_event("renderer discovery", "attached supervisor started");
+    #[cfg(target_os = "macos")]
+    let listener_identity = ListenerIdentity::AttachedProcess(pinned_process);
+    #[cfg(not(target_os = "macos"))]
+    let listener_identity = ListenerIdentity::OfficialExecutable(installation.executable);
     supervise(
         endpoint,
         bridge,
         injection,
-        ListenerIdentity::OfficialExecutable(installation.executable),
+        listener_identity,
         args.allow_any_page,
         IdlePolicy::ExitAfterTimeout,
         CancellationToken::new(),
@@ -591,7 +611,7 @@ pub(super) async fn activate(args: ActivateArgs) -> Result<(), AppError> {
     );
     let installation = discover_codex(None, None, args.channel)?;
     record_startup_event("discovery", "installation found");
-    if installation.source != DiscoverySource::WindowsPackageManager {
+    if !trusted_app_source(installation.source) {
         runtime_log::record(
             "launcher",
             "live activation",
@@ -847,5 +867,22 @@ pub(super) fn startup_timeout_for_idle_policy(idle_policy: IdlePolicy) -> Durati
     match idle_policy {
         IdlePolicy::RecoverUntilCancelled => Duration::from_secs(120),
         IdlePolicy::ExitAfterTimeout => Duration::from_secs(30),
+    }
+}
+
+fn trusted_app_source(source: DiscoverySource) -> bool {
+    matches!(source, DiscoverySource::WindowsPackageManager | DiscoverySource::MacApplication)
+}
+
+#[cfg(test)]
+mod macos_integration_tests {
+    use super::*;
+    #[test]
+    fn attach_trust_requires_a_verified_distribution() {
+        assert!(trusted_app_source(DiscoverySource::WindowsPackageManager));
+        assert!(trusted_app_source(DiscoverySource::MacApplication));
+        for source in [DiscoverySource::Explicit, DiscoverySource::Path, DiscoverySource::UserInstall] {
+            assert!(!trusted_app_source(source));
+        }
     }
 }

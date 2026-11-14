@@ -62,6 +62,10 @@ impl NativeBridge {
             return Err(update_busy_error());
         }
         self.ensure_epoch(epoch)?;
+        #[cfg(target_os = "macos")]
+        if self.inner.update_checker.endpoint.is_empty() {
+            return Err(crate::update_contract::macos_release_feed_unavailable());
+        }
         let params: UpdateInstallParams = serde_json::from_value(params).map_err(|error| {
             operation_error(
                 BridgeError::invalid_request(),

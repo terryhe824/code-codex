@@ -1611,7 +1611,8 @@ mod tests {
                 let _ = client.write_all(&bytes);
             }
         });
-        reqwest::Client::new()
+        // This response is served by the fixture's own loopback socket.
+        reqwest::Client::builder().no_proxy().build().unwrap()
             .get(format!("http://{address}/fixture"))
             .send()
             .await

@@ -3855,6 +3855,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // Requires native parsing of a drive-letter/backslash target.
     fn install_adopts_renamed_user_shortcut_to_chatgpt_executable() {
         let fixture = fixture();
         let shell = FakeShell;
@@ -4120,6 +4121,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // The install-root language transaction is a Windows-only command.
     fn language_install_commit_joins_shortcut_journal_and_rolls_back() {
         let fixture=fixture();let shell=FakeShell;
         fs::write(fixture.paths.install_root.join("storage-layout.json"),br#"{"schema":1,"product":"Code-Codex","layout":"centralized"}"#).unwrap();

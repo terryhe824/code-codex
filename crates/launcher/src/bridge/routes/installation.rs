@@ -46,6 +46,27 @@ fn installed_root() -> io::Result<PathBuf> {
 }
 
 impl NativeBridge {
+    #[cfg(target_os = "macos")]
+    pub(super) async fn installation_open(&self, params: Value, epoch: u64) -> Result<Value, BridgeError> {
+        if !params.as_object().is_some_and(serde_json::Map::is_empty) {
+            return Err(BridgeError::invalid_request());
+        }
+        self.ensure_epoch(epoch)?;
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let root = installed_root().map_err(|_| {
+                BridgeError::new("INSTALLATION_UNAVAILABLE", "No owned Code-Codex bundle was found.")
+            })?;
+            crate::macos_installation::validate_installed_core(&root, &std::env::current_exe()
+                .map_err(|_| internal_error())?)
+                .map_err(|_| BridgeError::new("INSTALLATION_ROOT", "Could not validate the installed Code-Codex bundle."))?;
+            this.ensure_epoch(epoch)?;
+            super::reveal_in_file_explorer(&root)
+                .map_err(|_| BridgeError::new("INSTALLATION_OPEN", "Could not reveal the Code-Codex bundle in Finder."))?;
+            Ok(json!({"opened":true}))
+        }).await.map_err(|_| internal_error())?
+    }
+
     pub(super) async fn installation_restart(&self,params:Value,epoch:u64)->Result<Value,BridgeError>{
         if !params.as_object().is_some_and(serde_json::Map::is_empty){return Err(BridgeError::invalid_request());}
         self.ensure_epoch(epoch)?;
@@ -76,7 +97,18 @@ impl NativeBridge {
                 launch().map_err(|e| BridgeError::new("UNINSTALL_OPEN", format!("Opening the Code-Codex uninstall wizard failed: {e}")))?;
                 Ok(json!({"opened":true}))
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "macos")]
+            {
+                let launch = || -> io::Result<()> {
+                    let root = installed_root()?;
+                    let core = std::env::current_exe()?;
+                    crate::macos_installation::uninstaller_command(&root, &core)?.spawn()?;
+                    Ok(())
+                };
+                launch().map_err(|e| BridgeError::new("UNINSTALL_OPEN", format!("Opening the Code-Codex uninstall wizard failed: {e}")))?;
+                Ok(json!({"opened":true}))
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
             { Err(BridgeError::new("UNSUPPORTED", "The uninstall wizard is unavailable on this platform.")) }
         }).await.map_err(|_| internal_error())?
     }

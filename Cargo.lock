@@ -332,12 +332,14 @@ dependencies = [
  "futures-util",
  "junction",
  "known-folders",
+ "libc",
  "process-wrap",
  "rcgen",
  "regex-automata",
  "reqwest",
  "rustls",
  "same-file",
+ "security-framework",
  "semver",
  "serde",
  "serde_json",
@@ -375,6 +377,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 name = "context-resolver"
 version = "0.6.20"
 dependencies = [
+ "nix",
  "process-wrap",
  "serde",
  "serde_json",

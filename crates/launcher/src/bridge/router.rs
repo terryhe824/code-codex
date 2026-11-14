@@ -66,6 +66,10 @@ impl BridgeHandler for NativeBridge {
                     crate::startup_examples::chunk(id,offset)
                 }
                 "explorer.installation.open" => {
+                    #[cfg(target_os = "macos")]
+                    return self.installation_open(request.params, epoch).await;
+                    #[cfg(not(target_os = "macos"))]
+                    {
                     if request.params.as_object().is_some_and(|p| !p.is_empty()) { return Err(BridgeError::invalid_request()); }
                     let root = workspace_service::application_paths::install_root().map_err(|e|BridgeError::new("INSTALLATION_ROOT",format!("Resolving the installation folder failed: {e}")))?.ok_or_else(||BridgeError::new("INSTALLATION_UNAVAILABLE","No installed Code-Codex directory was found."))?;
                     workspace_service::application_paths::validate_install_root(&root).map_err(|e|BridgeError::new("INSTALLATION_ROOT",format!("Validating the installation folder failed: {e}")))?;
@@ -76,6 +80,7 @@ impl BridgeHandler for NativeBridge {
                     }
                     #[cfg(not(windows))]
                     { Err(BridgeError::new("UNSUPPORTED","Opening the installation folder is unavailable on this platform.")) }
+                    }
                 }
                 "explorer.host.updates.retry" => {if !request.params.as_object().is_some_and(serde_json::Map::is_empty){return Err(BridgeError::invalid_request())}self.ensure_epoch(epoch)?;Ok(crate::host_updates::retry())},
                 "explorer.host.updates.status" => {if !request.params.as_object().is_some_and(serde_json::Map::is_empty){return Err(BridgeError::invalid_request())}crate::host_updates::status().map_err(|_|BridgeError::new("HOST_UPDATE_REPORT","The local update status is unavailable."))},

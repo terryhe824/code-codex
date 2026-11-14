@@ -363,6 +363,30 @@ fn installation(root: &Path) -> crate::discovery::CodexInstallation {
         app_server: None,
     }
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mac_inventory_covers_the_bundle_resources_and_keeps_the_bundle_identity() {
+    let directory = tempfile::TempDir::new_in("/private/tmp").unwrap();
+    let app = directory.path().join("中文 Codex.APP");
+    fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+    fs::create_dir_all(app.join("Contents/Resources")).unwrap();
+    fs::write(app.join("Contents/MacOS/Host"), b"fixture").unwrap();
+    fs::write(app.join("Contents/Info.plist"), b"fixture metadata").unwrap();
+    asar(&app.join("Contents/Resources/app.asar"), json!({"main.js":{"offset":"0","size":4}}), b"code");
+    let mut installation = installation(directory.path());
+    installation.executable = app.join("Contents/MacOS/Host");
+    installation.source = crate::discovery::DiscoverySource::MacApplication;
+    installation.package_full_name = None;
+    installation.package_name = Some("com.openai.codex".into());
+    let snapshot = scan::inventory(&installation, None, true).unwrap();
+    assert!(snapshot.complete, "{:?}", snapshot.issues);
+    assert_eq!(snapshot.root, app.to_string_lossy());
+    assert_eq!(snapshot.package, "com.openai.codex");
+    assert!(snapshot.entries.contains_key("Contents/Info.plist"));
+    assert!(snapshot.entries.contains_key("Contents/Resources/app.asar"));
+    assert!(snapshot.entries.contains_key("Contents/Resources/app.asar!/main.js"));
+}
 #[test]
 fn every_registered_dependency_signal_reaches_the_scanner_without_marking_unknown_code_safe() {
     let d = tempfile::tempdir().unwrap();
@@ -705,4 +729,60 @@ fn explicit_reclassification_records_new_mappings_and_keeps_original_report_byte
     assert_eq!(analysis_status(&latest)["status"], "current");
     assert_eq!(fs::read(&path).unwrap(), original);
     assert_eq!(gate(dir.path(), Some(&next), "old", false, next.clone()).unwrap()["scanned"], false);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mac_inventory_records_internal_framework_links_without_following_external_links() {
+    use std::os::unix::fs::symlink;
+    let directory = tempfile::TempDir::new_in("/private/tmp").unwrap();
+    let app = directory.path().join("Host.app");
+    let framework = app.join("Contents/Frameworks/Host.framework");
+    fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+    fs::create_dir_all(app.join("Contents/Resources")).unwrap();
+    fs::create_dir_all(framework.join("Versions/A")).unwrap();
+    fs::write(app.join("Contents/MacOS/Host"), b"fixture").unwrap();
+    fs::write(framework.join("Versions/A/Host"), b"framework").unwrap();
+    fs::write(app.join("Contents/Resources/literal\\name"), b"resource").unwrap();
+    asar(&app.join("Contents/Resources/app.asar"), json!({}), b"");
+    symlink("A", framework.join("Versions/Current")).unwrap();
+    symlink("Versions/Current/Host", framework.join("Host")).unwrap();
+    let mut installation = installation(directory.path());
+    installation.executable = app.join("Contents/MacOS/Host");
+    installation.source = crate::discovery::DiscoverySource::MacApplication;
+    let snapshot = scan::inventory(&installation, None, true).unwrap();
+    assert!(snapshot.complete, "{:?}", snapshot.issues);
+    let link = &snapshot.entries["Contents/Frameworks/Host.framework/Host"];
+    assert_eq!(link.kind, "bundle_symbolic_link");
+    assert_eq!(link.sha256, hash(b"Versions/Current/Host"));
+    assert!(snapshot.entries.contains_key("Contents/Frameworks/Host.framework/Versions/A/Host"));
+    assert!(!snapshot.entries.contains_key("Contents/Frameworks/Host.framework/Versions/Current/Host"));
+    assert!(snapshot.entries.contains_key("Contents/Resources/literal\\name"));
+    let outside = directory.path().join("outside");
+    fs::write(&outside, b"must not be read").unwrap();
+    symlink(&outside, app.join("Contents/Resources/external")).unwrap();
+    symlink("missing", app.join("Contents/Resources/dangling")).unwrap();
+    let incomplete = scan::inventory(&installation, None, true).unwrap();
+    assert!(!incomplete.complete);
+    assert_eq!(incomplete.issues.len(), 2);
+    assert!(!incomplete.entries.contains_key("Contents/Resources/external"));
+    assert!(!incomplete.entries.contains_key("Contents/Resources/dangling"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mac_inventory_does_not_claim_an_aliased_asar_was_expanded() {
+    let directory = tempfile::TempDir::new_in("/private/tmp").unwrap();
+    let app = directory.path().join("Host.app");
+    fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+    fs::create_dir_all(app.join("Contents/Resources")).unwrap();
+    fs::write(app.join("Contents/MacOS/Host"), b"fixture").unwrap();
+    asar(&app.join("Contents/payload.bin"), json!({"main.js":{"offset":"0","size":4}}), b"code");
+    std::os::unix::fs::symlink("../payload.bin", app.join("Contents/Resources/app.asar")).unwrap();
+    let mut installation = installation(directory.path());
+    installation.executable = app.join("Contents/MacOS/Host");
+    installation.source = crate::discovery::DiscoverySource::MacApplication;
+    let snapshot = scan::inventory(&installation, None, true).unwrap();
+    assert!(!snapshot.complete, "unexpanded ASAR alias must not qualify");
+    assert_eq!(snapshot.entries["Contents/Resources/app.asar"].kind, "bundle_symbolic_link");
 }
