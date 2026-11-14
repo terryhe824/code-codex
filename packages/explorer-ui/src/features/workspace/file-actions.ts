@@ -14,7 +14,7 @@ import { type ContextMenuAction,type ContextMenuAnchor,type ContextMenuDialog,ty
 import { isPathWithin,joinAbsolutePath } from "../../core/bridge/response-validation";
 import { CONTEXT_DIALOG_HEIGHT,CONTEXT_MENU_ITEM_HEIGHT,CONTEXT_MENU_MARGIN,CONTEXT_MENU_WIDTH } from "../../core/configuration/explorer";
 import { t } from '../../i18n';
-import { contextActionTextKeys,contextNameActionCopy,entryNameValidationError,isContextMenuAction } from '../file-operations/context-menu';
+import { contextActionTextKey,contextNameActionCopy,entryNameValidationError,isContextMenuAction } from '../file-operations/context-menu';
 export interface FileActionsControllerPorts {
  readonly clearFileClipboard:(expected:{paths:string[];operation:"copy"|"cut"})=>void;
  readonly workspaceSession:Readonly<WorkspaceSession<WorkspaceBridge>>;
@@ -151,8 +151,8 @@ export class FileActionsController {
       icon.innerHTML=item.icon;
       const label=document.createElement("span");
       label.className="context-menu-label";
-      label.dataset.i18nKey=contextActionTextKeys[item.action];
-      label.textContent=t(contextActionTextKeys[item.action]);
+      label.dataset.i18nKey=contextActionTextKey(item.action);
+      label.textContent=t(label.dataset.i18nKey);
       button.append(icon,label);
       fragment.append(button);
       first=false;
@@ -623,7 +623,7 @@ contextMenuItems(target: ContextMenuTarget): ContextMenuItem[] {
             { action: "delete", label: "Delete", icon: icons.trash, danger: true },
             { action: "copy-relative", label: "Copy Relative Path", icon: icons.copy, separatorBefore: true },
             { action: "copy-absolute", label: "Copy Absolute Path", icon: icons.link },
-            { action: "reveal", label: "Reveal in File Explorer", icon: icons.reveal },
+            { action: "reveal", label: t(contextActionTextKey("reveal")), icon: icons.reveal },
         ];
         if (target.kind === "file") {
             return [{ action: "preview", label: "Preview", icon: icons.preview }, ...create, ...mutate];

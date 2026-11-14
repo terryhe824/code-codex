@@ -1,9 +1,10 @@
+import {fixtureChromePath} from '../browser-fixture.mjs';
 import fs from 'node:fs';import path from 'node:path';import {spawn} from 'node:child_process';import {pathToFileURL} from 'node:url';
 export const root=path.resolve(import.meta.dirname,'../..'),out=path.join(root,'artifacts/import-reconciliation');fs.mkdirSync(out,{recursive:true});
 export const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 export async function openBrowser(html){
  const file=path.join(out,'fixture-'+Date.now()+'.html');fs.writeFileSync(file,html);
- const child=spawn('C:/Program Files/Google/Chrome/Application/chrome.exe',['--headless=new','--no-sandbox','--disable-gpu','--enable-unsafe-swiftshader','--autoplay-policy=no-user-gesture-required','--allow-file-access-from-files','--window-size=1280,900','--remote-debugging-port=0','--user-data-dir='+path.join(out,'profile-'+Date.now()),'about:blank'],{stdio:['ignore','ignore','pipe'],windowsHide:true});
+ const child=spawn(fixtureChromePath,['--headless=new','--no-sandbox','--disable-gpu','--enable-unsafe-swiftshader','--autoplay-policy=no-user-gesture-required','--allow-file-access-from-files','--window-size=1280,900','--remote-debugging-port=0','--user-data-dir='+path.join(out,'profile-'+Date.now()),'about:blank'],{stdio:['ignore','ignore','pipe'],windowsHide:true});
  let endpoint;try{endpoint=await new Promise((r,j)=>{let log='',timer=setTimeout(()=>j(Error('browser startup timeout')),15000);child.stderr.on('data',b=>{log+=b;const m=log.match(/DevTools listening on (ws:\/\/\S+)/);if(m){clearTimeout(timer);r(m[1]);}});child.once('error',j);});}catch(e){child.kill();throw e;}
  const ws=new WebSocket(endpoint);await new Promise((r,j)=>{ws.onopen=r;ws.onerror=j;});let id=0,session;const pending=new Map();
  ws.onmessage=e=>{const m=JSON.parse(e.data),p=pending.get(m.id);if(p){clearTimeout(p.timer);pending.delete(m.id);m.error?p.reject(Error(JSON.stringify(m.error))):p.resolve(m.result);}};

@@ -1,4 +1,13 @@
 {
+  "context.revealFinder": "在 Finder 中显示",
+  "context.invalidMacName": "此名称在 macOS 上无效。",
+  "context.actionMacAccessDenied": "macOS 拒绝访问此项目。",
+  "context.importMacUnreadable": "macOS 无法读取其中一个拖入的项目。",
+  "context.importMacFinderUnreadable": "Finder 未提供可读取的拖放文件或文件夹。",
+  "context.importMacAccessDenied": "macOS 拒绝访问其中一个拖入的项目。",
+  "context.importAccessDeniedMacOne": "已复制 {count} 个项目，但 macOS 拒绝访问其中一个拖入的项目。",
+  "context.importAccessDeniedMacMany": "已复制 {count} 个项目，但 macOS 拒绝访问其中一个拖入的项目。",
+  "context.previewMacSaveDenied": "macOS 拒绝保存此文件。草稿已保留。",
   "context.copyAbsolute": "复制绝对路径",
   "context.copyRelative": "复制相对路径",
   "context.delete": "删除",

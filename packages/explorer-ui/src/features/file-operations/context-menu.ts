@@ -5,12 +5,15 @@ import { isMacOs } from "../../core/configuration/platform";
 import { icons } from "../../icons";
 
 /** Stable UI keys derive from actions, never by searching displayed English. */
-export const contextActionTextKeys: Readonly<Record<ContextMenuAction,string>> = {
+const contextActionTextKeys: Readonly<Record<ContextMenuAction,string>> = {
   'new-file':'context.newFile','new-folder':'context.newFolder',rename:'context.rename',
   delete:'context.delete','copy-relative':'context.copyRelative','copy-absolute':'context.copyAbsolute',
   reveal:'context.reveal',refresh:'context.refresh',preview:'context.preview',
 };
 
+export function contextActionTextKey(action: ContextMenuAction): string {
+  return action==="reveal"&&isMacOs() ? "context.revealFinder" : contextActionTextKeys[action];
+}
 
 export function isContextMenuAction(value: unknown): value is ContextMenuAction {
   return value==="preview"||
@@ -83,7 +86,7 @@ export function contextActionError(action: ContextMenuAction|"move"|"paste",erro
             :"The item";
   const code=errorCode(error);
   if(code==="ACCESS_DENIED") return isMacOs()
-    ? `${subject} could not be changed because macOS denied access.`
+    ? "macOS denied access to the requested item."
     : `${subject} could not be changed because Windows denied access.`;
   if(code==="NOT_FOUND") return `${subject} no longer exists.`;
   if(code==="CONFLICT"||code==="ALREADY_EXISTS") {

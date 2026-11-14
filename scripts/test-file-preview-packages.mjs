@@ -14,7 +14,29 @@ const allPackages=JSON.parse(readFileSync(resolve(ui,'dist/plugins/catalog.json'
 assertCatalogMatchesDeclarations(allPackages,root);
 const catalog=allPackages.filter(p=>p.category==='file-preview');
 assert.equal(catalog.length,10,'All ten previews must exist in the production catalog');
-for(const p of catalog){for(const a of [p,...(p.resources??[])]){const bytes=readFileSync(resolve(ui,'dist/plugins/file-preview',p.id,a.relativePath||a.asset));assert.equal(bytes.length,a.size);assert.equal(createHash('sha256').update(bytes).digest('hex'),a.sha256);}const meta=JSON.parse(readFileSync(resolve(ui,'dist/plugins/file-preview',p.id,`${p.id}.metafile.json`),'utf8'));const keys=Object.keys(meta.inputs).map(k=>k.replaceAll('\\','/'));if(p.id!=='pdf-preview')assert(!keys.some(k=>k.includes('pdfjs-dist')));if(p.id!=='office-preview')assert(!keys.some(k=>['docx-preview','@aiden0z','@extend-ai','react-dom','jszip'].some(n=>k.includes(n))));if(p.id!=='model-preview')assert(!keys.some(k=>k.includes('node_modules/three')));}
+const metadataUnavailable = [];
+for (const plugin of catalog) {
+ for (const asset of [plugin, ...(plugin.resources ?? [])]) {
+  const bytes = readFileSync(resolve(ui, 'dist/plugins/file-preview', plugin.id, asset.relativePath || asset.asset));
+  assert.equal(bytes.length, asset.size);
+  assert.equal(createHash('sha256').update(bytes).digest('hex'), asset.sha256);
+ }
+ let metadata;
+ try {
+  metadata = readFileSync(resolve(ui, 'dist/plugins/file-preview', plugin.id, `${plugin.id}.metafile.json`), 'utf8');
+ } catch (error) {
+  if (error.code !== 'ENOENT') throw error;
+  // Release packages publish the locked JS and resources, while source builds
+  // also produce esbuild dependency metadata. Continue exercising release bytes.
+  metadataUnavailable.push(plugin.id);
+  continue;
+ }
+ const inputs = Object.keys(JSON.parse(metadata).inputs).map(path => path.replaceAll('\\', '/'));
+ if (plugin.id !== 'pdf-preview') assert(!inputs.some(path => path.includes('pdfjs-dist')));
+ if (plugin.id !== 'office-preview') assert(!inputs.some(path => ['docx-preview', '@aiden0z', '@extend-ai', 'react-dom', 'jszip'].some(name => path.includes(name))));
+ if (plugin.id !== 'model-preview') assert(!inputs.some(path => path.includes('node_modules/three')));
+}
+
 const bundle=await build({absWorkingDir:ui,bundle:true,minify:true,metafile:true,write:false,target:['chrome120'],define:{__CODE_CODEX_VERSION__:JSON.stringify(version),__CODE_CODEX_PLUGIN_CATALOG__:JSON.stringify(allPackages)},stdin:{contents:`import {registerMainPreviewElement,MAIN_PREVIEW_TAG} from './main-preview';import {connectPluginPackages,isPluginPackageLoaded} from './plugin-runtime';registerMainPreviewElement();window.fixtureTag=MAIN_PREVIEW_TAG;window.connectPreviewPackages=connectPluginPackages;window.isFixturePackageVerified=isPluginPackageLoaded;`,resolveDir:resolve(ui,'src'),sourcefile:'preview-package.fixture.ts',loader:'ts'}});
 const coreSource=bundle.outputFiles[0].text;writeFileSync(resolve(out,'core.js'),coreSource);writeFileSync(resolve(out,'core.metafile.json'),JSON.stringify(bundle.metafile,null,2));
 const heavy=['pdfjs-dist','@aiden0z','@extend-ai','docx-preview','jszip','markdown-it','turndown','node_modules/three','react-dom'];
@@ -30,7 +52,7 @@ const html=`<!doctype html><html data-theme="dark"><meta charset="utf-8"><style>
 const server=createServer((req,res)=>{res.setHeader('Content-Type',req.url==='/'?'text/html':'text/javascript');res.end(req.url==='/'?html:req.url==='/core.js'?coreSource:'');});await new Promise(r=>server.listen(0,'127.0.0.1',r));
 const browser=await launchFixture(`http://127.0.0.1:${server.address().port}/`);const ev=browser.evaluate;
 const wait=async(ex,label,ms=16000)=>{const end=Date.now()+ms;while(Date.now()<end){if(await ev(ex))return;await delay(60)}throw Error(label+' timed out');};
-const report={version,classification:'F: actual compiled independent modules in an isolated preview shell with simulated already-downloaded native cache, not real Github downloads',checks:[],viewers:[],coreBytes:Buffer.byteLength(coreSource)};
+const report={version,classification:'F: actual compiled independent modules in an isolated preview shell with simulated already-downloaded native cache, not real Github downloads',checks:[],viewers:[],metadataUnavailable,coreBytes:Buffer.byteLength(coreSource)};
 try{
  await wait('!!window.viewer','viewer registered');
  await ev(`viewer.setState({activePath:'plain.ts',tabs:[{kind:'text',path:'plain.ts',name:'plain.ts',text:'const value=42;',sizeBytes:15,truncated:false}],enabledPreviewers:[]})`);
@@ -46,9 +68,18 @@ try{
  for(const[kind,path,selector]of types){
   await ev(`viewer.setState({activePath:${JSON.stringify(path)},tabs:[views.find(v=>v.path===${JSON.stringify(path)})],enabledPreviewers:ids})`);await wait(`!!viewer.shadowRoot.querySelector(${JSON.stringify(selector)})`,kind+' render');if(kind==='image')await wait(`viewer.shadowRoot.querySelector('img').naturalWidth>0`,'image decode');if(['audio','video'].includes(kind))await wait(`viewer.shadowRoot.querySelector('${kind}').readyState>=1`,kind+' metadata');
   const result=await ev(`(()=>{const c=viewer.shadowRoot.querySelector(${JSON.stringify(selector)}),r=c.getBoundingClientRect();return {kind:${JSON.stringify(kind)},width:r.width,height:r.height,errors:errors.slice(),moduleIds:[...window[Symbol.for('code-codex:plugin-modules:v1')].keys()],errorPanels:viewer.shadowRoot.querySelectorAll('.view-state.error,.pdf-page-error,.model-preview-status.error').length}})()`);
-  assert(result.width>0&&result.height>0,kind+' bounds');assert.equal(result.errorPanels,0,kind+' errors');assert.deepEqual(result.errors,[]);report.viewers.push(result);
+  assert(result.width>0&&result.height>0,kind+' bounds');assert.equal(result.errorPanels,0,kind+' errors');assert.deepEqual(result.errors,[]);
+  const packageId = `code-codex.${kind}-preview`;
+  const setViewer = enabled => ev(`viewer.setState({activePath:${JSON.stringify(path)},tabs:[views.find(view=>view.path===${JSON.stringify(path)})],enabledPreviewers:ids.filter(id=>${enabled}||id!==${JSON.stringify(packageId)})})`);
+  await setViewer(false);
+  await wait(`!viewer.shadowRoot.querySelector(${JSON.stringify(selector)})`, kind+' disabled');
+  const loadsBefore = await ev('packageLoadCalls.length');
+  await setViewer(true);
+  await wait(`!!viewer.shadowRoot.querySelector(${JSON.stringify(selector)})`, kind+' cached re-enable');
+  assert.equal(await ev('packageLoadCalls.length'), loadsBefore, kind+' uses already verified offline module');
+  report.viewers.push({...result, disabled:true, enabledFromCache:true});
  }
- assert.equal(await ev(`window[Symbol.for('code-codex:plugin-modules:v1')].size`),10);report.checks.push('All ten real viewer modules load only as selected and render minimal valid content');
+ assert.equal(await ev(`window[Symbol.for('code-codex:plugin-modules:v1')].size`),10);report.checks.push('All ten locked viewer modules render valid content, disable and re-enable from cache');
 
  await ev(`window.badViews=[{kind:'pdf',path:'bad.pdf',name:'bad.pdf',mimeType:'application/pdf',bytes:new TextEncoder().encode('not a PDF'),sizeBytes:9},{kind:'office',path:'bad.docx',name:'bad.docx',mimeType:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',bytes:new TextEncoder().encode('not a zip'),sizeBytes:9},{kind:'notebook',path:'bad.ipynb',name:'bad.ipynb',mimeType:'application/x-ipynb+json',bytes:new TextEncoder().encode('{invalid'),sizeBytes:8},{kind:'model',path:'bad.gltf',name:'bad.gltf',mimeType:'model/gltf+json',bytes:new TextEncoder().encode('{invalid'),sizeBytes:8,version:'a'.repeat(64),resources:[]},{kind:'text',path:'bad.drawio',name:'bad.drawio',text:'<!DOCTYPE test [<!ENTITY remote SYSTEM "https://outside.invalid/file">]><mxfile>&remote;</mxfile>',sizeBytes:100,truncated:false}];`);
  for(let i=0;i<5;i++){
@@ -66,5 +97,5 @@ try{
  }
  report.checks.push('Immediate switching cancels five asynchronous viewers and stale results cannot replace the retained source tab');
  await ev(`viewer.setState({activePath:null,tabs:[],enabledPreviewers:ids});viewer.remove()`);await delay(150);assert.equal(await ev('liveUrls.size'),0);assert.deepEqual(await ev('errors'),[]);report.checks.push('Switching/closing the ten viewers releases all tracked Object URLs without unhandled browser errors');
- report.passed=true;writeFileSync(resolve(out,'result.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({passed:true,coreBytes:report.coreBytes,checks:report.checks,viewers:report.viewers.map(v=>v.kind)}));
+ report.passed=true;writeFileSync(resolve(out,'result.json'),JSON.stringify(report,null,2));console.log(JSON.stringify({passed:true,coreBytes:report.coreBytes,checks:report.checks,metadataUnavailable,viewers:report.viewers.map(v=>v.kind)}));
 }catch(error){report.passed=false;report.error=String(error);report.state=await ev(`({errors,text:viewer.shadowRoot.querySelector('.preview-content')?.textContent.slice(-1400),calls:packageLoadCalls})`).catch(()=>({}));writeFileSync(resolve(out,'result.json'),JSON.stringify(report,null,2));throw error;}finally{await browser.close();await new Promise(r=>server.close(r));await stop();}

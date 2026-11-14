@@ -1,9 +1,11 @@
 // Domain extracted from the original explorer composition; behavior and storage contracts retained.
 import { ExplorerBridgeError } from "../../bridge";
 import { EXTERNAL_IMPORT_CHUNK_BYTES,INTERNAL_DRAG_TYPE,MAX_EXTERNAL_IMPORT_DEPTH,MAX_EXTERNAL_IMPORT_ENTRIES,MAX_EXTERNAL_IMPORT_FILE_BYTES,MAX_EXTERNAL_IMPORT_TOTAL_BYTES } from "../../core/configuration/explorer";
+import { isMacOs } from "../../core/configuration/platform";
 import { type ExternalDataTransferItem,type ExternalDirectoryHandle,type ExternalDropBudget,type ExternalDropCandidate,type ExternalDropMember,type ExternalDropRoot } from "../../contracts/explorer-model";
 import { asRecord,errorCode,normalizeNode } from "../../core/bridge/response-validation";
 import { recordCaughtRuntimeError } from "../../runtime-operations";
+import { t } from "../../i18n";
 import { type TreeNodeInput } from "../../contracts/bridge";
 import { entryNameValidationError } from "./context-menu";
 
@@ -296,11 +298,13 @@ export function joinExternalDropPath(parent: string,name: string): string {
 export function ensureDistinctExternalRootNames(roots: readonly ExternalDropRoot[]): void {
   const names=new Set<string>();
   for(const root of roots) {
-    const folded=root.name.normalize("NFC").toLocaleLowerCase();
-    if(names.has(folded)) {
+    // macOS volumes differ in case and normalization behavior. The native
+    // destination checks and atomic commit decide aliases on the actual volume.
+    const key=isMacOs() ? root.name : root.name.normalize("NFC").toLocaleLowerCase();
+    if(names.has(key)) {
       throw new ExplorerBridgeError({ code: "CONFLICT",message: "Two dropped items have the same name." });
     }
-    names.add(folded);
+    names.add(key);
   }
 }
 
@@ -309,7 +313,8 @@ export function normalizeExternalDropReadError(error: unknown): ExplorerBridgeEr
   if(error instanceof ExplorerBridgeError) return error;
   const name=error instanceof DOMException? error.name:"";
   const code=name==="NotAllowedError"||name==="SecurityError"? "ACCESS_DENIED":"NOT_FOUND";
-  return new ExplorerBridgeError({ code,message: "Windows could not read one of the dropped items." });
+  const message=isMacOs() ? "macOS could not read one of the dropped items." : "Windows could not read one of the dropped items.";
+  return new ExplorerBridgeError({ code,message });
 }
 
 
@@ -387,7 +392,12 @@ export function externalImportError(error: unknown,committedCount: number): stri
   if(code==="INVALID_PATH"||code==="INVALID_NAME"||code==="INVALID_REQUEST") {
     return `${prefix}one of the dropped items has a name or path that cannot be copied.`;
   }
-  if(code==="ACCESS_DENIED") return `${prefix}Windows denied access to one of the dropped items.`;
+  if(code==="ACCESS_DENIED") {
+    if(!isMacOs()) return `${prefix}Windows denied access to one of the dropped items.`;
+    if(committedCount===0) return "macOS denied access to one of the dropped items.";
+    const key=committedCount===1 ? "context.importAccessDeniedMacOne" : "context.importAccessDeniedMacMany";
+    return t(key,{count:committedCount.toLocaleString()});
+  }
   if(code==="NOT_FOUND") return `${prefix}one of the dropped items changed or became unavailable.`;
   if(code==="CANCELLED") return `${prefix}the copy was cancelled because the active workspace changed.`;
   if(code==="TIMEOUT") return `${prefix}copying the dropped items timed out.`;

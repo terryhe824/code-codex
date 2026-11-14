@@ -7,7 +7,9 @@ const root = fileURLToPath(new URL('../packages/explorer-ui/src/', import.meta.u
 const result = await build({
   stdin: {
     contents: `
-      export {entryNameValidationError} from "./features/file-operations/context-menu";
+      export {contextActionError,entryNameValidationError} from "./features/file-operations/context-menu";
+      export {ensureDistinctExternalRootNames,externalImportError,normalizeExternalDropReadError} from "./features/file-operations/external-import";
+      export {editSaveError} from "./features/preview/responses";
       export {PreviewWorkspaceController} from "./features/workspace/preview-workspace";
       export {joinAbsolutePath} from "./core/bridge/response-validation";
       export {TreeModel} from "./tree-model";
@@ -23,9 +25,35 @@ const result = await build({
   format: 'esm',
   write: false,
 });
-const {entryNameValidationError, PreviewWorkspaceController, TreeModel, joinAbsolutePath} = await import(
+const {contextActionError, editSaveError, entryNameValidationError, ensureDistinctExternalRootNames, externalImportError, normalizeExternalDropReadError, PreviewWorkspaceController, TreeModel, joinAbsolutePath} = await import(
   'data:text/javascript;base64,' + Buffer.from(result.outputFiles[0].text + '\n//# sourceURL=macos-file-names-test-bundle.js').toString('base64')
 );
+
+test('macOS preserves case-distinct import roots and rejects identical roots', () => {
+  return withPlatform('MacIntel', () => {
+    assert.doesNotThrow(() => ensureDistinctExternalRootNames([{name: 'Name.txt'}, {name: 'name.txt'}]));
+    assert.throws(() => ensureDistinctExternalRootNames([{name: 'Name.txt'}, {name: 'Name.txt'}]), {code: 'CONFLICT'});
+  });
+});
+
+test('Windows retains case-insensitive import duplicate checking', () => {
+  return withPlatform('Win32', () => {
+    assert.throws(() => ensureDistinctExternalRootNames([{name: 'Name.txt'}, {name: 'name.txt'}]), {code: 'CONFLICT'});
+  });
+});
+
+test('platform file actions preserve access-denied errors and saved drafts', async () => {
+  for (const [platform, os] of [['MacIntel', 'macOS'], ['Win32', 'Windows']]) {
+    await withPlatform(platform, () => {
+      const permission = normalizeExternalDropReadError(new DOMException('private path', 'NotAllowedError'));
+      assert.equal(permission.code, 'ACCESS_DENIED');
+      assert.equal(permission.message, `${os} could not read one of the dropped items.`);
+      assert.equal(externalImportError(permission, 0), `${os} denied access to one of the dropped items.`);
+      assert.match(contextActionError('reveal', permission), new RegExp(os));
+      assert.equal(editSaveError(permission), `${os} denied permission to save this file. Your draft has been kept.`);
+    });
+  }
+});
 
 async function withPlatform(platform, callback) {
   const original = Object.getOwnPropertyDescriptor(globalThis, 'navigator');

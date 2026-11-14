@@ -1,6 +1,7 @@
 // Domain extracted from the original explorer composition; behavior and storage contracts retained.
 import { ExplorerBridgeError } from "../../bridge";
 import { MAX_MEDIA_CHUNK_BYTES,MAX_PREVIEW_TEXT_UNITS } from "../../core/configuration/explorer";
+import { isMacOs } from "../../core/configuration/platform";
 import { type MediaPreviewRoute,type NormalizedMediaInfo,type NormalizedPreview,type PreviewUnavailableReason } from "../../contracts/explorer-model";
 import { asRecord,errorCode } from "../../core/bridge/response-validation";
 import { ModelPreviewSourceError } from "./model-source";
@@ -172,7 +173,9 @@ export function encodeBase64(bytes: Uint8Array): string {
 export function editSaveError(error: unknown): string {
   const code=errorCode(error);
   if(code==="CONFLICT") return "This file changed on disk. Reload it before saving.";
-  if(code==="ACCESS_DENIED") return "Windows denied permission to save this file. Your draft has been kept.";
+  if(code==="ACCESS_DENIED") return isMacOs()
+    ? "macOS denied permission to save this file. Your draft has been kept."
+    : "Windows denied permission to save this file. Your draft has been kept.";
   if(code==="NOT_FOUND") return "This file no longer exists at its original location. Your draft has been kept.";
   if(code==="TOO_LARGE"||code==="PAYLOAD_TOO_LARGE"||code==="CONTENT_TOO_LARGE") {
     return "This draft is larger than the 64 KB editing limit.";

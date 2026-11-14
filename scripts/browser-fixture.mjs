@@ -2,10 +2,15 @@ import {spawn} from 'node:child_process';
 import {mkdtempSync,readFileSync,rmSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve,sep} from 'node:path';
+import {env,platform} from 'node:process';
 export const delay=ms=>new Promise(r=>setTimeout(r,ms));
+export const fixtureChromePath = env.CHROME_PATH ?? (platform === 'darwin'
+  ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+  : 'C:/Program Files/Google/Chrome/Application/chrome.exe');
 export async function launchFixture(url){
   const profile=mkdtempSync(join(tmpdir(),'code-codex-package-test-'));
-  const process=spawn('C:/Program Files/Google/Chrome/Application/chrome.exe',['--headless=new','--no-sandbox','--disable-gpu','--enable-unsafe-swiftshader','--autoplay-policy=no-user-gesture-required','--window-size=1500,1000','--remote-debugging-port=0',`--user-data-dir=${profile}`,url],{stdio:'ignore',windowsHide:true});
+  const chrome=fixtureChromePath;
+  const process=spawn(chrome,['--headless=new','--no-sandbox','--disable-gpu','--enable-unsafe-swiftshader','--autoplay-policy=no-user-gesture-required','--window-size=1500,1000','--remote-debugging-port=0',`--user-data-dir=${profile}`,url],{stdio:'ignore',windowsHide:true});
   let socket;let sequence=0;const pending=new Map();
   for(let i=0;i<200&&!existsSync(join(profile,'DevToolsActivePort'));i++)await delay(50);
   const port=readFileSync(join(profile,'DevToolsActivePort'),'utf8').split('\n')[0];

@@ -1,4 +1,13 @@
 {
+  "context.revealFinder": "Reveal in Finder",
+  "context.invalidMacName": "That name is not valid on macOS.",
+  "context.actionMacAccessDenied": "macOS denied access to the requested item.",
+  "context.importMacUnreadable": "macOS could not read one of the dropped items.",
+  "context.importMacFinderUnreadable": "Finder did not provide any readable files or folders for this drop.",
+  "context.importMacAccessDenied": "macOS denied access to one of the dropped items.",
+  "context.importAccessDeniedMacOne": "{count} item was copied, but macOS denied access to one of the dropped items.",
+  "context.importAccessDeniedMacMany": "{count} items were copied, but macOS denied access to one of the dropped items.",
+  "context.previewMacSaveDenied": "macOS denied permission to save this file. Your draft has been kept.",
   "context.copyAbsolute": "Copy Absolute Path",
   "context.copyRelative": "Copy Relative Path",
   "context.delete": "Delete",

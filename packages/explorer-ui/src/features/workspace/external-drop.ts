@@ -3,6 +3,7 @@ import { type ExplorerContext,type ExplorerViewState,type FlatTreeRow,type TreeN
 import { type ContextMenuTarget,type DragSource,type ExternalDropCandidate,type ExternalDropRoot,type ExternalImportProgress } from "../../contracts/explorer-model";
 import { errorCode,isPathWithin } from "../../core/bridge/response-validation";
 import { DROP_EXPAND_DELAY_MS,EXTERNAL_IMPORT_CHUNK_BYTES,EXTERNAL_IMPORT_COMMIT_TIMEOUT_MS,EXTERNAL_IMPORT_REQUEST_INTERVAL_MS,INTERNAL_DRAG_TYPE } from "../../core/configuration/explorer";
+import { isMacOs } from "../../core/configuration/platform";
 import { runtimeEvent } from "../../runtime-events";
 import { recordCaughtRuntimeError } from "../../runtime-operations";
 import { TreeModel } from "../../tree-model";
@@ -147,7 +148,9 @@ onDropZoneDrop(event: DragEvent, allowRoot: boolean): void {
             return;
         }
         if (!candidates.length) {
-            this.host.showActionNotice("Windows did not provide any readable files or folders for this drop.", "error");
+            this.host.showActionNotice(isMacOs()
+                ? "Finder did not provide any readable files or folders for this drop."
+                : "Windows did not provide any readable files or folders for this drop.", "error");
             return;
         }
         void this.importExternalDrop(candidates, destination);
