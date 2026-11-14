@@ -24,6 +24,12 @@ Code-Codex 是一个非官方社区项目，用来为 Codex Desktop 增加本地
 > [!IMPORTANT]
 > Code-Codex 与 OpenAI 无关
 
+## macOS 开发适配分支
+
+此分支增加 Apple Silicon macOS 的构建、应用发现、进程与文件服务、Keychain、登录项和本地安装/回滚。目标是完整复刻 Windows 功能，当前仍是开发版：真实登录宿主、多账号、原生透明和旧版 PowerPoint 导出尚未完成验收，部分插件保留已知基线缺陷。
+
+构建与安装见 [macOS 使用说明](docs/macos-install.md)，逐项测试与缺口见 [macOS 验收记录](docs/macos-parity.md)。本地 `.app`、DMG、ZIP 使用 ad-hoc 签名，尚未公证或配置 Mac 在线更新源。以下 EXE/MSI 安装说明仍适用于 Windows。
+
 ![Codex 中的 Code-Codex 文件树](docs/screenshots/file-tree-conversation.png)
 
 ![带语法高亮的 Code-Codex 代码预览](docs/screenshots/code-preview.png)

@@ -20,9 +20,10 @@ if [[ ! -d packages/explorer-ui/node_modules ]]; then
 fi
 npm --prefix packages/explorer-ui run typecheck
 npm --prefix packages/explorer-ui run build
+node scripts/build-host-update-probes.mjs
 if [[ "$profile" == release ]]; then
-  cargo build --locked -p code-codex --bin code-codex --release
+  MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --locked -p code-codex --bin code-codex --bin code-codex-launcher --release
 else
-  cargo build --locked -p code-codex --bin code-codex
+  MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --locked -p code-codex --bin code-codex --bin code-codex-launcher
 fi
 "target/$profile/code-codex" --version

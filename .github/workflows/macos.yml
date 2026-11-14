@@ -1,0 +1,60 @@
+name: macOS ARM64
+on:
+  pull_request:
+  push:
+    branches: [main, 'codex/macos-*']
+permissions:
+  contents: read
+jobs:
+  build-and-contracts:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      TMPDIR: /private/tmp
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/explorer-ui/package-lock.json
+      - name: Require the native ARM64 runner
+        run: test "$(uname -m)" = arm64
+      - name: Update Rust
+        run: rustup update stable --no-self-update
+      - name: Install pinned UI dependencies
+        run: npm --prefix packages/explorer-ui ci
+      - name: Build Mac core and GUI launcher
+        run: bash scripts/build-macos.sh
+      - name: Prepare an isolated test keychain
+        run: |
+          security default-keychain -d user > "$RUNNER_TEMP/code-codex-original-keychain"
+          security create-keychain -p ephemeral-ci-test "$RUNNER_TEMP/code-codex-tests.keychain-db"
+          security set-keychain-settings -lut 3600 "$RUNNER_TEMP/code-codex-tests.keychain-db"
+          security unlock-keychain -p ephemeral-ci-test "$RUNNER_TEMP/code-codex-tests.keychain-db"
+          security default-keychain -d user -s "$RUNNER_TEMP/code-codex-tests.keychain-db"
+      - name: Rust workspace regression
+        run: cargo test --workspace --locked -- --test-threads=1
+      - name: Remove the isolated test keychain
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/code-codex-original-keychain"; then
+            original=$(python3 -c 'import pathlib,os; print(pathlib.Path(os.environ["RUNNER_TEMP"],"code-codex-original-keychain").read_text().strip().strip(chr(34)))')
+            if test -n "$original"; then security default-keychain -d user -s "$original"; fi
+          fi
+          if test -f "$RUNNER_TEMP/code-codex-tests.keychain-db"; then
+            security delete-keychain "$RUNNER_TEMP/code-codex-tests.keychain-db"
+          fi
+      - name: Shared architecture and file contracts
+        run: node --test scripts/test-refactor-contracts.mjs scripts/test-plugin-publication.mjs scripts/test-maintenance-isolation.mjs scripts/test-file-mutation-isolation.mjs scripts/test-macos-file-names.mjs
+      - name: Development package contracts
+        run: python3 scripts/macos/test_package.py
+      - name: Isolated probe process cleanup
+        run: python3 -W error::ResourceWarning scripts/macos/test_probe.py
+      - name: Build local development package
+        run: python3 scripts/macos/package.py --binary target/debug/code-codex --output artifacts/macos-ci --version "$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "code-codex"))')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Code-Codex-macos-arm64-development
+          path: artifacts/macos-ci/

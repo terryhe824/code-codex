@@ -1,5 +1,11 @@
 # Code-Codex
 
+## macOS development port
+
+This branch adds Apple Silicon builds, signed host discovery, native process and file services, Keychain integration, login startup and local installation/rollback. Full Windows feature parity remains the goal. Logged-in host integration, real multi-account flows, native window transparency and legacy PowerPoint export are not accepted yet; some upstream plugin defects remain recorded.
+
+See the [Mac build and installation guide](docs/macos-install.md) and [parity evidence and gaps](docs/macos-parity.md) (Chinese). Local app/DMG/ZIP artifacts are ad-hoc signed, not notarized; a Mac online update feed is not configured. The existing EXE/MSI instructions below apply to Windows.
+
 Windows startup can offer a consent-based graceful restart when an unmanaged
 official Codex instance is already open. The dialog warns about interrupted tasks
 and unsaved changes, with an optional remembered choice. See [startup conflict
