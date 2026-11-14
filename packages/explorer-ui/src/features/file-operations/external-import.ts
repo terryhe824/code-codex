@@ -265,8 +265,9 @@ export function readExternalFileEntry(entry: FileSystemFileEntry): Promise<File>
 
 
 export function chargeExternalDropEntry(name: string,depth: number,budget: ExternalDropBudget): void {
-  if(entryNameValidationError(name)) {
-    throw new ExplorerBridgeError({ code: "INVALID_PATH",message: "A dropped item has a name Windows cannot copy." });
+  const validationError=entryNameValidationError(name);
+  if(validationError) {
+    throw new ExplorerBridgeError({ code: "INVALID_PATH",message: validationError });
   }
   if(depth>MAX_EXTERNAL_IMPORT_DEPTH||budget.entries>=MAX_EXTERNAL_IMPORT_ENTRIES) {
     throw new ExplorerBridgeError({ code: "TOO_MANY_ENTRIES",message: "The dropped folder exceeds the import limits." });

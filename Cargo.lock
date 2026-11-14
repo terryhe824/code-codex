@@ -3031,6 +3031,7 @@ dependencies = [
  "dunce",
  "ignore",
  "notify",
+ "rustix",
  "same-file",
  "serde",
  "serde_json",

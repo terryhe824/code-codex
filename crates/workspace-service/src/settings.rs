@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
@@ -114,7 +114,7 @@ impl PreparedSettings {
 
 impl SettingsStore {
     pub fn for_current_user() -> Result<Self, WorkspaceError> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos"))]
         {
             Ok(Self::new(
                 crate::application_paths::data_root()
@@ -122,7 +122,7 @@ impl SettingsStore {
                     .join("settings.json"),
             ))
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             let directories = ProjectDirs::from("dev", "CodeCodex", "CodeCodex")
                 .ok_or(WorkspaceError::Internal)?;

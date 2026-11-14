@@ -391,6 +391,15 @@ fn filter_event_with_active_staging(
         .collect();
     if paths.is_empty() {
         FilteredEvent::Drop
+    } else if cfg!(target_os = "macos")
+        && matches!(
+            event.kind,
+            EventKind::Modify(ModifyKind::Name(RenameMode::Any))
+        )
+    {
+        // FSEvents reports each spelling independently, with no reliable
+        // pairing or direction. Reload the tree without inventing either.
+        FilteredEvent::Resync
     } else {
         let mut filtered = event.clone();
         filtered.paths = paths;
@@ -523,6 +532,14 @@ mod tests {
         relative_path: &str,
         expected: ChangeKind,
     ) -> Change {
+        receive_change_matching(receiver, relative_path, |kind| kind == expected).await
+    }
+
+    async fn receive_change_matching(
+        receiver: &mut mpsc::Receiver<ChangeBatch>,
+        relative_path: &str,
+        predicate: impl Fn(ChangeKind) -> bool,
+    ) -> Change {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let batch = tokio::time::timeout_at(deadline, receiver.recv())
@@ -532,7 +549,7 @@ mod tests {
             if let Some(change) = batch
                 .changes
                 .into_iter()
-                .find(|change| change.relative_path == relative_path && change.kind == expected)
+                .find(|change| change.relative_path == relative_path && predicate(change.kind))
             {
                 return change;
             }
@@ -854,22 +871,56 @@ mod tests {
         receive_change(&mut subscription.receiver, "created.txt", ChangeKind::Added).await;
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ambiguous_fsevents_rename_refreshes_only_visible_entries() {
+        let directory = TempDir::new().expect("temp dir");
+        let root = directory.path();
+        let rename = EventKind::Modify(ModifyKind::Name(RenameMode::Any));
+        let visible = Event::new(rename).add_path(root.join("previous.txt"));
+        assert!(matches!(
+            filter_event(root, &visible, WatchVisibility::default()),
+            FilteredEvent::Resync
+        ));
+
+        for path in [".hidden.txt", "node_modules/package/index.js"] {
+            for kind in [rename, EventKind::Create(CreateKind::File)] {
+                let ignored = Event::new(kind).add_path(root.join(path));
+                assert!(matches!(
+                    filter_event(root, &ignored, WatchVisibility::default()),
+                    FilteredEvent::Drop
+                ));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn emits_real_modify_and_delete_kinds() {
         let directory = TempDir::new().expect("temp dir");
         let path = directory.path().join("lifecycle.txt");
-        fs::write(&path, "initial").expect("initial file");
         let workspace = Arc::new(Workspace::open(directory.path()).expect("workspace"));
         let mut subscription =
             WorkspaceWatcher::subscribe(workspace, Duration::from_millis(100)).expect("watch");
 
-        fs::write(&path, "modified contents").expect("modify");
+        fs::write(&path, "initial").expect("initial file");
+        // Let FSEvents deliver the create before checking a separate content change.
         receive_change(
             &mut subscription.receiver,
             "lifecycle.txt",
-            ChangeKind::Modified,
+            ChangeKind::Added,
         )
         .await;
+        fs::write(&path, "modified contents").expect("modify");
+        receive_change_matching(&mut subscription.receiver, "lifecycle.txt", |kind| {
+            // FSEvents may carry Create forward with the next Content event.
+            // The renderer refreshes a known path for either wire kind.
+            kind == ChangeKind::Modified || (cfg!(target_os = "macos") && kind == ChangeKind::Added)
+        })
+        .await;
+        assert_eq!(
+            fs::read_to_string(&path).expect("modified file"),
+            "modified contents"
+        );
 
         fs::remove_file(&path).expect("delete");
         receive_change(
@@ -885,10 +936,12 @@ mod tests {
         let directory = TempDir::new().expect("temp dir");
         let old = directory.path().join("before.txt");
         let new = directory.path().join("after.txt");
-        fs::write(&old, "rename me").expect("initial file");
         let workspace = Arc::new(Workspace::open(directory.path()).expect("workspace"));
         let mut subscription =
-            WorkspaceWatcher::subscribe(workspace, Duration::from_millis(100)).expect("watch");
+            WorkspaceWatcher::subscribe(workspace.clone(), Duration::from_millis(100))
+                .expect("watch");
+        fs::write(&old, "rename me").expect("initial file");
+        receive_change(&mut subscription.receiver, "before.txt", ChangeKind::Added).await;
 
         fs::rename(&old, &new).expect("rename");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -899,6 +952,15 @@ mod tests {
                 .await
                 .expect("watch timeout")
                 .expect("watch closed");
+            if cfg!(target_os = "macos") && batch.resync {
+                let listing = workspace
+                    .list(crate::ListOptions::default())
+                    .expect("reload");
+                assert!(batch.changes.is_empty());
+                assert_eq!(listing.entries.len(), 1);
+                assert_eq!(listing.entries[0].relative_path, "after.txt");
+                return;
+            }
             for change in batch.changes {
                 if change.kind == ChangeKind::Renamed
                     && change.relative_path == "after.txt"

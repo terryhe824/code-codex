@@ -5,6 +5,7 @@ import { type NormalizedPreview,type PreviewTab } from "../../contracts/explorer
 import type { MainPreviewPort } from "../../contracts/main-preview";
 import { errorCode,isPathWithin } from "../../core/bridge/response-validation";
 import { MAX_PREVIEW_TABS,PREVIEW_SELECTION_DELAY_MS } from "../../core/configuration/explorer";
+import { normalizeWorkspaceSeparators } from "../../core/configuration/platform";
 import { GLTF_BINARY_PREVIEW_MIME,GLTF_JSON_PREVIEW_MIME } from "../../core/preview/configuration";
 import { type MainPreviewFileView } from "../../file-preview/contracts";
 import { gitHistoryError,normalizeGitDiff } from "../../git-history-facade";
@@ -42,7 +43,7 @@ export class PreviewWorkspaceController {
  }
 
   async openGitDiff(hash: string,path: string): Promise<void> {
-    const normalizedPath=path.replaceAll("\\","/");
+    const normalizedPath=normalizeWorkspaceSeparators(path);
     const name=normalizedPath.split("/").at(-1)||normalizedPath;
     const tabPath=`git-diff://${hash}/${normalizedPath}`;
     if(

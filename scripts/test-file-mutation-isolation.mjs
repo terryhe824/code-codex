@@ -18,3 +18,79 @@ test('workspace change stops remaining delete requests and does not clear or ref
 test('late paste completion from an old workspace cannot clear clipboard or refresh a new workspace',async()=>{const f=fixture();f.bridge.request=async()=>{f.session.generation++;};await f.subject.pasteFiles();assert.equal(f.host.fileClipboard,f.clipboard);assert.deepEqual(f.calls,[]);assert.equal(f.busy(),false);});
 test('shared busy gate prevents keyboard paste and delete from starting another write',async()=>{const f=fixture(),lease=f.host.mutations.acquire();await f.subject.pasteFiles();await f.subject.deleteSelectedFiles();assert.deepEqual(f.calls,[]);assert.equal(f.busy(),true);lease.release();});
 test('failed delete releases its lease and reports the original failure without retrying later paths',async()=>{const f=fixture();let calls=0;f.bridge.request=async()=>{calls++;throw Error('disk denied');};await f.subject.deleteSelectedFiles();assert.equal(calls,1);assert.equal(f.busy(),false);assert.deepEqual(f.calls,['notice']);});
+
+const explorerSource = await readFile(new URL('../packages/explorer-ui/src/app/explorer-element.ts', import.meta.url), 'utf8');
+const explorerAst = ts.createSourceFile('explorer-element.ts', explorerSource, ts.ScriptTarget.Latest, true);
+const explorerClass = explorerAst.statements.find(ts.isClassDeclaration);
+const applyChanges = explorerClass.members.find(member => ts.isMethodDeclaration(member) && member.name.getText(explorerAst) === '#applyChanges');
+const watcherConsumer = ts.transpileModule(`
+const runtimeEvent = () => {};
+const asRecord = value => value;
+const normalizeChange = value => value;
+export class WatcherConsumer {
+  #previeweditingSettings = {drafts: {}};
+  #previewWorkspace;
+  #treeinteractionSettings = {model: {applyChange: () => [], loadedDirectories: () => []}, renderTree() {}};
+  #pendingMarks = new Map();
+  #scheduleChangeExpiry() {}
+  #scheduleRefresh() {}
+  #announce() {}
+  constructor(openPreview) {
+    this.#previewWorkspace = {markPreviewModified: path => openPreview.reload(path)};
+  }
+  apply(changes) { this.#applyChanges(changes); }
+  ${applyChanges.getText(explorerAst)}
+}
+`, {compilerOptions: {target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext}});
+const {WatcherConsumer} = await import('data:text/javascript;base64,' + Buffer.from(watcherConsumer.outputText).toString('base64'));
+
+test('an Added watcher event refreshes an existing file preview', () => {
+  const reloaded = [];
+  const consumer = new WatcherConsumer({
+    reload(path) {
+      if (path === 'open.txt') reloaded.push(path);
+    },
+  });
+  consumer.apply([{kind: 'added', relativePath: 'open.txt'}, {kind: 'added', relativePath: 'new.txt'}]);
+  assert.deepEqual(reloaded, ['open.txt']);
+});
+
+const onNotification = explorerClass.members.find(member => ts.isMethodDeclaration(member) && member.name.getText(explorerAst) === '#onNotification');
+const notificationConsumer = ts.transpileModule(`
+const runtimeEvent = () => {};
+const asRecord = value => value;
+const getBootstrapConfig = () => ({});
+export class NotificationConsumer {
+  #updatesSettings = {};
+  #showActionProgress() {}
+  #updateMessage = {};
+  #workspaceSession = {context: {threadId: 'same'}};
+  #state = 'ready';
+  #applyChanges() {}
+  #switchThread() {}
+  #nativeReconnectMarker = {};
+  #setState() {}
+  #previeweditingSettings = {drafts: {path: 'draft.txt', text: 'unsaved'}};
+  #previewWorkspace = {tabStore: {items: [{path:'draft.txt'}, {path:'preview.txt'}]}, markPreviewModified: path => this.invalidated.push(path)};
+  #refreshLoadedDirectories() {this.refreshes++; return Promise.resolve();}
+  refreshes = 0; reconnects = 0; invalidated = [];
+  get draft() {return this.#previeweditingSettings.drafts;}
+  get tabs() {return this.#previewWorkspace.tabStore.items;}
+  reconnectNative() {this.reconnects++;}
+  notify(method, params) {this.#onNotification(method, params);}
+  ${onNotification.getText(explorerAst)}
+}`, {compilerOptions: {target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext}});
+const {NotificationConsumer} = await import('data:text/javascript;base64,' + Buffer.from(notificationConsumer.outputText).toString('base64'));
+test('ambiguous filesystem rename rescans the tree without discarding drafts or preview tabs', () => {
+  const consumer = new NotificationConsumer();
+  const draft = consumer.draft, tabs = consumer.tabs;
+  consumer.notify('explorer.resync', {scope: 'filesystem'});
+  assert.equal(consumer.reconnects, 0);
+  assert.equal(consumer.refreshes, 1);
+  assert.equal(consumer.draft, draft);
+  assert.equal(consumer.draft.text, 'unsaved');
+  assert.equal(consumer.tabs, tabs);
+  assert.deepEqual(consumer.invalidated, ['preview.txt']);
+  consumer.notify('explorer.resync', {});
+  assert.equal(consumer.reconnects, 1);
+});

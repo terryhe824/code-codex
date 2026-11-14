@@ -1,6 +1,7 @@
 // Domain extracted from the original explorer composition; behavior and storage contracts retained.
 import { type ContextMenuAction,type ContextMenuNameAction } from "../../contracts/explorer-model";
 import { errorCode } from "../../core/bridge/response-validation";
+import { isMacOs } from "../../core/configuration/platform";
 import { icons } from "../../icons";
 
 /** Stable UI keys derive from actions, never by searching displayed English. */
@@ -41,6 +42,12 @@ export function contextNameActionCopy(action: ContextMenuNameAction): {
 
 
 export function entryNameValidationError(value: string): string|undefined {
+  if(isMacOs()) {
+    if(!value.length) return "Enter a name.";
+    if(value.length>255) return "Use a name with 255 characters or fewer.";
+    if(value==="."||value===".."||/[\/\u0000]/.test(value)) return "That name is not valid on macOS.";
+    return undefined;
+  }
   if(!value.length||!value.trim().length) return "Enter a name.";
   if(value.length>255) return "Use a name with 255 characters or fewer.";
   if(value==="."||value==="..") return "That name is reserved by Windows.";
@@ -75,7 +82,9 @@ export function contextActionError(action: ContextMenuAction|"move"|"paste",erro
             ? "The directory"
             :"The item";
   const code=errorCode(error);
-  if(code==="ACCESS_DENIED") return `${subject} could not be changed because Windows denied access.`;
+  if(code==="ACCESS_DENIED") return isMacOs()
+    ? `${subject} could not be changed because macOS denied access.`
+    : `${subject} could not be changed because Windows denied access.`;
   if(code==="NOT_FOUND") return `${subject} no longer exists.`;
   if(code==="CONFLICT"||code==="ALREADY_EXISTS") {
     if(action==="new-file") return "A file with that name already exists.";
@@ -87,7 +96,7 @@ export function contextActionError(action: ContextMenuAction|"move"|"paste",erro
   }
   if(code==="INVALID_REQUEST"||code==="INVALID_NAME"||code==="INVALID_PATH") {
     return action==="new-file"||action==="new-folder"||action==="rename"
-      ? "That name is not valid on Windows."
+      ? (isMacOs() ? "That name is not valid on macOS." : "That name is not valid on Windows.")
       :"The item path is no longer valid.";
   }
   if(code==="TOO_MANY_ENTRIES") return "This folder contains too many items to change safely.";

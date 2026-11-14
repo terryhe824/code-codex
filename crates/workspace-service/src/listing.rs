@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{WorkspaceError, map_io};
 use crate::path_guard::{
-    DirectoryCapability, is_link_or_reparse, open_canonical_root, validate_relative,
-    verify_retained_root,
+    DirectoryCapability, is_link_or_reparse, open_canonical_root, relative_path_text,
+    validate_relative, verify_retained_root,
 };
 
 const DEFAULT_PAGE_SIZE: usize = 200;
@@ -226,7 +226,7 @@ impl Workspace {
                 continue;
             }
 
-            let relative_path = relative.to_string_lossy().replace('\\', "/");
+            let relative_path = relative_path_text(&relative);
             let kind = if is_reparse {
                 EntryKind::Symlink
             } else if is_directory {
@@ -316,7 +316,7 @@ fn is_hidden_attributes(name: &str, attributes: u32) -> bool {
 }
 
 fn make_inaccessible(parent: &Path, name: &str) -> TreeEntry {
-    let relative_path = parent.join(name).to_string_lossy().replace('\\', "/");
+    let relative_path = relative_path_text(&parent.join(name));
     TreeEntry {
         id: relative_path.clone(),
         name: name.to_owned(),
@@ -570,7 +570,7 @@ mod tests {
     }
 
     fn relative_text(path: &Path) -> String {
-        path.to_string_lossy().replace('\\', "/")
+        relative_path_text(path)
     }
 
     fn assert_visible(workspace: &Workspace, relative: &Path, name: &str) {

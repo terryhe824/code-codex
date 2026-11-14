@@ -149,7 +149,7 @@
         "packages/explorer-ui/src/native-background-surfaces.ts",
         "packages/explorer-ui/src/plugin-host/backgrounds/spectral-drape.ts",
         "packages/explorer-ui/src/effects/spectral-drape/model.ts",
-        "packages/explorer-ui/src/features/plugin-settings/parameter-panel.ts"
+        "packages/explorer-ui/src/components/parameter-panel.ts"
       ],
       "tests": [
         "scripts/test-appearance-adapter.mjs",

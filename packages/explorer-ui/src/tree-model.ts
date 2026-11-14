@@ -1,4 +1,5 @@
 import { type ChangeKind, type ExplorerChange, type FlatTreeRow, type ListResult, type TreeNodeInput } from "./contracts/bridge";
+import { isMacOs, normalizeWorkspaceSeparators } from "./core/configuration/platform";
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 export const MAX_RENDERER_NODES = 10_000;
@@ -14,11 +15,12 @@ function boundedLimit(value: number | undefined, fallback: number): number {
 }
 
 function normalizePath(path: string): string | null {
-  const normalized = path.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/{2,}/g, "/").replace(/\/$/, "");
+  const normalized = normalizeWorkspaceSeparators(path).replace(/^\.\//, "").replace(/\/{2,}/g, "/").replace(/\/$/, "");
   if (normalized === "") return "";
   if (
     normalized.startsWith("/") ||
-    normalized.includes(":") ||
+    (!isMacOs() && normalized.includes(":")) ||
+    normalized.includes("\u0000") ||
     normalized.split("/").some((part) => part === "" || part === "." || part === "..")
   ) {
     return null;

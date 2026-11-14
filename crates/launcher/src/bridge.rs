@@ -55,7 +55,6 @@ const MAX_UPDATE_RESPONSE_BYTES: usize = 256 * 1024;
 const UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPDATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(180);
-#[cfg(windows)]
 static UPDATE_INSTALLER_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -428,7 +427,7 @@ impl NativeBridge {
                 if batch.resync {
                     bridge
                         .notify_watcher_at(
-                            json!({ "method": "explorer.resync", "params": {} }),
+                            json!({ "method": "explorer.resync", "params": {"scope":"filesystem"} }),
                             lifecycle_epoch,
                             generation,
                         )
@@ -678,7 +677,31 @@ fn allow_explorer_foreground_activation() {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn finder_reveal_command(target: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("/usr/bin/open");
+    command
+        .arg("-R")
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_in_file_explorer(target: &Path) -> Result<(), WorkspaceError> {
+    let status = finder_reveal_command(target)
+        .status()
+        .map_err(|_| WorkspaceError::Internal)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(WorkspaceError::Internal)
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn reveal_in_file_explorer(_target: &Path) -> Result<(), WorkspaceError> {
     Err(WorkspaceError::Internal)
 }
@@ -1011,7 +1034,10 @@ mod tests {
         assert!(!valid_git_relative_path(""));
         assert!(!valid_git_relative_path("../secret.txt"));
         assert!(!valid_git_relative_path("/absolute.txt"));
+        #[cfg(windows)]
         assert!(!valid_git_relative_path("C:\\absolute.txt"));
+        #[cfg(target_os = "macos")]
+        assert!(valid_git_relative_path("C:\\absolute.txt"));
     }
 
     #[test]
@@ -2616,7 +2642,9 @@ mod tests {
         for params in [
             json!({ "parentRelativePath": "../outside", "name": "x", "kind": "file" }),
             json!({ "parentRelativePath": "", "name": "../outside", "kind": "file" }),
+            #[cfg(not(target_os = "macos"))]
             json!({ "parentRelativePath": "", "name": "CON.txt", "kind": "file" }),
+            #[cfg(not(target_os = "macos"))]
             json!({ "parentRelativePath": "", "name": "trailing.", "kind": "directory" }),
         ] {
             let error = bridge
@@ -3025,7 +3053,11 @@ mod tests {
         )
         .expect("reveal file");
         let relative = "folder with spaces/\u{6587}\u{4ef6}.txt";
-        let expected = directory.path().join(relative);
+        let expected = directory
+            .path()
+            .canonicalize()
+            .expect("canonical workspace")
+            .join(relative);
         let captured = Arc::new(StdMutex::new(None::<std::path::PathBuf>));
         let opener_capture = captured.clone();
         let response = bridge
@@ -3077,6 +3109,21 @@ mod tests {
         assert_eq!(wide.last().copied(), Some(0));
         let roundtrip = std::ffi::OsString::from_wide(&wide[..wide.len() - 1]);
         assert_eq!(roundtrip, target.as_os_str());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finder_reveal_passes_the_validated_path_as_a_single_argument() {
+        use std::{ffi::OsStr, process::Command};
+
+        let target = Path::new("/private/tmp/空间 & $(ignored); 精度.txt");
+        // Inspect the real native command without changing the user's Finder window.
+        let command: Command = finder_reveal_command(target);
+        assert_eq!(command.get_program(), "/usr/bin/open");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [OsStr::new("-R"), target.as_os_str()]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4019,11 +4066,14 @@ use contracts::{
 #[path = "platform/windows/window.rs"]
 mod platform_windows_window;
 
-#[cfg(any(windows, not(windows)))]
+#[cfg(windows)]
 use platform_windows_window::reveal_in_file_explorer;
+#[cfg(windows)]
 use platform_windows_window::{
     ACCENT_DISABLED, ACCENT_ENABLE_TRANSPARENT_GRADIENT, GetWindowCompositionAttributeFn,
     SetWindowCompositionAttributeFn, WCA_ACCENT_POLICY, WINDOW_TRANSPARENCY_ACCENT_FLAGS,
+};
+use platform_windows_window::{
     WINDOW_TRANSPARENCY_BACKGROUND, WindowTransparencyController, WindowTransparencyError,
 };
 #[cfg(windows)]

@@ -370,6 +370,16 @@ impl LanguageStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn store_fixture() -> (tempfile::TempDir, LanguageStore) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical storage root");
+        (directory, LanguageStore::new(root))
+    }
+
     #[test]
     fn normalization_uses_only_chinese_primary_tag() {
         for t in ["zh", "zh-TW", "ZH-cn", "zh_HK"] {
@@ -381,15 +391,14 @@ mod tests {
     }
     #[test]
     fn missing_read_has_no_side_effect() {
-        let d = tempfile::tempdir().expect("dir");
-        let root = d.path().join("missing");
+        let (_directory, store) = store_fixture();
+        let root = store.path().parent().expect("fixture root").join("missing");
         assert_eq!(LanguageStore::new(root.clone()).load().expect("load"), None);
         assert!(!root.exists());
     }
     #[test]
     fn roundtrip_cas_and_same_locale() {
-        let d = tempfile::tempdir().expect("dir");
-        let s = LanguageStore::new(d.path().to_owned());
+        let (_directory, s) = store_fixture();
         let p = s
             .save(Locale::Chinese, 0, Source::Installer, || true)
             .expect("save");
@@ -413,8 +422,7 @@ mod tests {
     }
     #[test]
     fn failed_authorization_preserves_previous_bytes() {
-        let d = tempfile::tempdir().expect("dir");
-        let s = LanguageStore::new(d.path().to_owned());
+        let (d, s) = store_fixture();
         s.save(Locale::English, 0, Source::Installer, || true)
             .expect("first");
         let b = fs::read(s.path()).expect("bytes");
@@ -424,8 +432,7 @@ mod tests {
     }
     #[test]
     fn rejects_corruption_and_never_implicitly_overwrites_it() {
-        let d = tempfile::tempdir().expect("dir");
-        let s = LanguageStore::new(d.path().to_owned());
+        let (_directory, s) = store_fixture();
         for b in [
             b"{}".to_vec(),
             vec![b'x'; 4097],
@@ -442,8 +449,7 @@ mod tests {
     }
     #[test]
     fn explicit_reselection_backs_up_corruption() {
-        let d = tempfile::tempdir().expect("dir");
-        let s = LanguageStore::new(d.path().to_owned());
+        let (d, s) = store_fixture();
         fs::write(s.path(), b"damaged").expect("fixture");
         s.save(Locale::Chinese, 0, Source::Menu, || true)
             .expect("repair");
@@ -465,15 +471,13 @@ mod tests {
     }
     #[test]
     fn rejects_directory_as_language_file() {
-        let d = tempfile::tempdir().expect("dir");
-        let s = LanguageStore::new(d.path().to_owned());
+        let (_directory, s) = store_fixture();
         fs::create_dir(s.path()).expect("fixture");
         assert!(s.load().is_err());
     }
     #[test]
     fn install_rollback_restores_absence_and_prior_selection_idempotently() {
-        let d = tempfile::tempdir().expect("dir");
-        let s = LanguageStore::new(d.path().to_owned());
+        let (_directory, s) = store_fixture();
         s.save(Locale::Chinese, 0, Source::Installer, || true)
             .expect("first install");
         s.restore_install(None, 1).expect("rollback absence");
@@ -495,8 +499,7 @@ mod tests {
     }
     #[test]
     fn install_rollback_does_not_overwrite_newer_user_selection() {
-        let d = tempfile::tempdir().expect("dir");
-        let s = LanguageStore::new(d.path().to_owned());
+        let (_directory, s) = store_fixture();
         let before = s
             .save(Locale::English, 0, Source::Installer, || true)
             .expect("before");

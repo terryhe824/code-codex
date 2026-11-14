@@ -2603,6 +2603,18 @@ export class CodeCodexElement extends HTMLElement {
             return;
         }
         if (method === "explorer.resync") {
+            if (asRecord(params)?.scope === "filesystem") {
+                // An ambiguous filesystem rename/overflow invalidates file
+                // listings, not the authenticated renderer session or drafts.
+                if (this.#workspaceSession.context) {
+                    void this.#refreshLoadedDirectories();
+                    for (const tab of this.#previewWorkspace.tabStore.items) {
+                        if (tab.path !== this.#previeweditingSettings.drafts.path && !tab.path.startsWith("git-diff://"))
+                            this.#previewWorkspace.markPreviewModified(tab.path);
+                    }
+                }
+                return;
+            }
             runtimeEvent('file-tree', 'native lifecycle recovery', 'started', { errorCode: 'CC-SESSION-RESYNC-001', readOnlyInitialization: true, writesReplayed: false });
             this.reconnectNative(this.#nativeReconnectMarker ?? getBootstrapConfig(), true);
             return;
@@ -2635,7 +2647,8 @@ export class CodeCodexElement extends HTMLElement {
                 this.#previewWorkspace.closePreviewTab(change.relativePath, false);
             else if (change.kind === "renamed")
                 this.#previewWorkspace.closePreviewTab(change.fromRelativePath ?? change.relativePath, false);
-            else if (change.kind === "modified")
+            // macOS can repeat a create flag when a known path is edited.
+            else if (change.kind === "modified" || change.kind === "added")
                 this.#previewWorkspace.markPreviewModified(change.relativePath);
             const affectedParents = this.#treeinteractionSettings.model.applyChange(change);
             this.#pendingMarks.set(change.relativePath, change.kind);

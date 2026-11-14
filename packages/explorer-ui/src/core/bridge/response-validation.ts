@@ -4,6 +4,7 @@ import { MAX_MODEL_RESOURCE_BYTES, MAX_MODEL_TEXTURE_BYTES } from "../preview/co
 import { type ExplorerChange,type ExplorerContext,type ExplorerSettings,type ListResult,type TreeNodeInput } from "../../contracts/bridge";
 import { DEFAULT_SETTINGS,MAX_MEDIA_CHUNK_BYTES,MODEL_RESOURCE_MIME_TYPES } from "../configuration/explorer";
 import { type NormalizedModelResourceInfo } from "../../contracts/explorer-model";
+import { isMacOs } from "../configuration/platform";
 
 
 export function asRecord(value: unknown): Record<string,unknown>|null {
@@ -130,6 +131,10 @@ export function normalizeSettings(raw: unknown): ExplorerSettings {
 // root's separator (backslash on Windows, forward slash elsewhere) so the
 // result is a native absolute path.
 export function joinAbsolutePath(root: string,relativePath: string): string {
+  if (isMacOs()) {
+    const base=root.replace(/\/+$/,"");
+    return relativePath? `${base}/${relativePath}`:base;
+  }
   const separator=root.includes("\\")? "\\":"/";
   const base=root.replace(/[\\/]+$/,"");
   const relative=relativePath.replace(/[\\/]+/g,separator);

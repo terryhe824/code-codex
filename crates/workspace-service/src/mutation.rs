@@ -5,11 +5,13 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use cap_fs_ext::OpenOptionsFollowExt as _;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use cap_primitives::fs::hard_link;
+#[cfg(not(target_os = "macos"))]
+use cap_primitives::fs::rename;
 use cap_primitives::fs::{
     DirOptions, FollowSymlinks, OpenOptions, create_dir, open, read_base_dir, remove_dir,
-    remove_file, rename, stat,
+    remove_file, stat,
 };
 
 use crate::error::{WorkspaceError, map_io};
@@ -17,7 +19,7 @@ use crate::listing::{EntryKind, TreeEntry, Workspace};
 use crate::path_guard::open_regular_file_nofollow;
 use crate::path_guard::{
     DirectoryCapability, is_contained, is_link_or_reparse, open_directory_nofollow,
-    same_file_identity, validate_relative,
+    relative_path_text, same_file_identity, validate_relative,
 };
 
 /// Maximum recursive depth accepted by one delete operation.
@@ -753,7 +755,7 @@ fn validate_non_root(relative_path: &str) -> Result<PathBuf, WorkspaceError> {
 }
 
 fn validate_leaf(name: &str) -> Result<&str, WorkspaceError> {
-    if name.is_empty() || name.encode_utf16().count() > MAX_LEAF_UTF16_UNITS {
+    if name.is_empty() || name.contains('/') || name.encode_utf16().count() > MAX_LEAF_UTF16_UNITS {
         return Err(WorkspaceError::InvalidPath);
     }
     let clean = validate_relative(name)?;
@@ -766,7 +768,7 @@ fn validate_leaf(name: &str) -> Result<&str, WorkspaceError> {
 
 fn checked_join(parent: &Path, leaf: &str) -> Result<PathBuf, WorkspaceError> {
     let joined = parent.join(leaf);
-    let normalized = joined.to_string_lossy().replace('\\', "/");
+    let normalized = relative_path_text(&joined);
     validate_relative(&normalized)
 }
 
@@ -907,6 +909,21 @@ fn ensure_rename_destination(
     destination_name: &Path,
     source_metadata: &cap_primitives::fs::Metadata,
 ) -> Result<(), WorkspaceError> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (source_name, source_metadata);
+        // The atomic rename decides whether an existing name denotes the
+        // same entry. Still reject symbolic links before invoking it.
+        return match stat(parent, destination_name, FollowSymlinks::No) {
+            Ok(metadata) if is_capability_link_or_reparse(&metadata) => {
+                Err(WorkspaceError::OutsideWorkspace)
+            }
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(map_io(&error)),
+        };
+    }
+
     #[cfg(windows)]
     if source_name != destination_name {
         return match stat(parent, destination_name, FollowSymlinks::No) {
@@ -934,9 +951,11 @@ fn ensure_rename_destination(
         };
     }
 
-    let _ = source_name;
-    let _ = source_metadata;
-    ensure_absent(parent, destination_name)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (source_name, source_metadata);
+        ensure_absent(parent, destination_name)
+    }
 }
 
 #[cfg(windows)]
@@ -974,7 +993,29 @@ fn rename_entry_no_replace(
     .map_err(|error| map_mutation_io(&error))
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn rename_entry_no_replace(
+    source_parent: &File,
+    source_name: &Path,
+    destination_parent: &File,
+    destination_name: &Path,
+    _source_metadata: &cap_primitives::fs::Metadata,
+) -> Result<(), WorkspaceError> {
+    use rustix::fs::{RenameFlags, renameat_with};
+
+    // APFS treats a case-only change as a rename of the same directory entry.
+    // RENAME_EXCL rejects a different entry even when it is a hard link.
+    renameat_with(
+        source_parent,
+        source_name,
+        destination_parent,
+        destination_name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| map_mutation_io(&error.into()))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn rename_entry_no_replace(
     source_parent: &File,
     source_name: &Path,
@@ -1000,7 +1041,7 @@ fn rename_entry_no_replace(
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn rename_file_no_replace(
     source_parent: &File,
     source_name: &Path,
@@ -1047,7 +1088,7 @@ fn kind_from_metadata(metadata: &cap_primitives::fs::Metadata) -> EntryKind {
 }
 
 fn make_tree_entry(relative: &Path, name: &str, kind: EntryKind) -> TreeEntry {
-    let relative_path = relative.to_string_lossy().replace('\\', "/");
+    let relative_path = relative_path_text(relative);
     TreeEntry {
         id: relative_path.clone(),
         name: name.to_owned(),
@@ -1640,7 +1681,7 @@ mod tests {
                 "unicode-hidden",
             )
             .expect("begin hidden Unicode import");
-        for invalid in ["../escape", "nested/../../escape", "C:/Windows"] {
+        for invalid in ["../escape", "nested/../../escape", "/Windows"] {
             assert_eq!(
                 session
                     .create_directory(invalid)
@@ -1680,10 +1721,77 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_names_round_trip_through_create_list_move_and_reveal() {
+        let (directory, workspace) = fixture();
+        fs::create_dir(directory.path().join("文本")).expect("destination");
+
+        for name in ["NUL.txt", "中文\\草稿:é*.txt. ", " "] {
+            let file = workspace
+                .create_entry("", name, CreateEntryKind::File)
+                .expect("valid macOS name");
+            assert_eq!(file.relative_path, name);
+            let moved = workspace
+                .move_entry(name, "文本")
+                .expect("move to another directory");
+            assert_eq!(moved.relative_path, format!("文本/{name}"));
+            assert!(
+                workspace
+                    .reveal_path(&moved.relative_path)
+                    .expect("reveal")
+                    .is_file()
+            );
+            let listed = workspace
+                .list(crate::ListOptions {
+                    relative_path: "文本".to_owned(),
+                    ..Default::default()
+                })
+                .expect("list destination");
+            assert!(
+                listed
+                    .entries
+                    .iter()
+                    .any(|entry| entry.relative_path == moved.relative_path)
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_case_only_directory_rename_preserves_its_contents() {
+        let (directory, workspace) = fixture();
+        fs::create_dir(directory.path().join("目录É")).expect("source directory");
+        fs::write(directory.path().join("目录É/value.txt"), "value").expect("source child");
+        workspace
+            .rename_entry("目录É", "目录é")
+            .expect("case-only directory rename");
+        let entry = fs::read_dir(directory.path())
+            .expect("directory")
+            .next()
+            .expect("entry")
+            .expect("accessible entry");
+        assert_eq!(entry.file_name(), "目录é");
+        assert_eq!(
+            fs::read_to_string(entry.path().join("value.txt")).expect("child"),
+            "value"
+        );
+    }
+
     #[test]
     fn strict_leaf_validation_rejects_ambiguous_reserved_and_long_names() {
         let (_directory, workspace) = fixture();
-        for invalid in ["", ".", "..", "nested/file", "nested\\file", "NUL.txt"] {
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "nested/file",
+            "nul\0character",
+            #[cfg(not(target_os = "macos"))]
+            "nested\\file",
+            #[cfg(not(target_os = "macos"))]
+            "NUL.txt",
+        ] {
             assert_eq!(
                 workspace
                     .create_entry("", invalid, CreateEntryKind::File)
@@ -1852,7 +1960,7 @@ mod tests {
         assert!(workspace.reveal_path("").is_ok());
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn file_rename_primitive_atomically_refuses_an_existing_destination() {
         let (directory, workspace) = fixture();
@@ -1939,11 +2047,11 @@ mod tests {
         fs::write(directory.path().join("file.txt"), "value").expect("file");
         assert_eq!(
             workspace.reveal_path("").expect("reveal root"),
-            directory.path()
+            workspace.root_path()
         );
         assert_eq!(
             workspace.reveal_path("file.txt").expect("reveal"),
-            directory.path().join("file.txt")
+            workspace.root_path().join("file.txt")
         );
         assert_eq!(
             workspace
@@ -2128,9 +2236,9 @@ mod tests {
         (parent, workspace, root, moved)
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
-    fn windows_case_only_rename_preserves_the_entry() {
+    fn case_only_rename_preserves_the_entry() {
         let (directory, workspace) = fixture();
         fs::write(directory.path().join("Name.txt"), "content").expect("file");
 
@@ -2149,9 +2257,9 @@ mod tests {
         assert_eq!(names, [OsString::from("name.txt")]);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
-    fn windows_unicode_case_only_rename_preserves_the_entry() {
+    fn unicode_case_only_rename_preserves_the_entry() {
         let (directory, workspace) = fixture();
         let upper = "\u{00c4}.txt";
         let lower = "\u{00e4}.txt";
@@ -2220,9 +2328,9 @@ mod tests {
         drop(held);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
-    fn windows_existing_hard_link_name_is_still_a_conflict() {
+    fn existing_hard_link_name_is_still_a_conflict() {
         let (directory, workspace) = fixture();
         let source = directory.path().join("source.txt");
         let destination = directory.path().join("destination.txt");

@@ -1921,7 +1921,9 @@ mod tests {
             "..",
             "../secret.rs",
             "/etc/passwd",
+            #[cfg(not(target_os = "macos"))]
             "C:/Windows/win.ini",
+            #[cfg(not(target_os = "macos"))]
             "src/main.rs:stream",
         ] {
             assert_eq!(

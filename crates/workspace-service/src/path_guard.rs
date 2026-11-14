@@ -1,3 +1,4 @@
+#[cfg(not(target_os = "macos"))]
 use std::ffi::OsStr;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
@@ -216,6 +217,23 @@ pub(crate) fn verify_retained_root(
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn validate_relative(relative: &str) -> Result<PathBuf, WorkspaceError> {
+    if relative.is_empty() {
+        return Ok(PathBuf::new());
+    }
+    if relative.len() > MAX_RELATIVE_PATH_UNITS
+        || relative.contains('\0')
+        || relative
+            .split('/')
+            .any(|part| matches!(part, "" | "." | ".."))
+    {
+        return Err(WorkspaceError::InvalidPath);
+    }
+    Ok(PathBuf::from(relative))
+}
+
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn validate_relative(relative: &str) -> Result<PathBuf, WorkspaceError> {
     if relative.len() > MAX_RELATIVE_PATH_UNITS || relative.contains('\0') {
         return Err(WorkspaceError::InvalidPath);
@@ -262,6 +280,7 @@ pub(crate) fn validate_relative(relative: &str) -> Result<PathBuf, WorkspaceErro
     Ok(clean)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn valid_windows_component(component: &OsStr) -> bool {
     let value = component.to_string_lossy();
     if value.is_empty()
@@ -286,6 +305,7 @@ fn valid_windows_component(component: &OsStr) -> bool {
         && !is_numbered_device(&upper, "LPT")
 }
 
+#[cfg(not(target_os = "macos"))]
 fn is_numbered_device(value: &str, prefix: &str) -> bool {
     value
         .strip_prefix(prefix)
@@ -376,7 +396,7 @@ pub(crate) fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
 
 pub(crate) fn relative_for_event(root: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
-    let text = relative.to_string_lossy().replace('\\', "/");
+    let text = relative_path_text(relative);
     let clean = validate_relative(&text).ok()?;
     let mut current = root.to_path_buf();
     for component in clean.components() {
@@ -400,6 +420,17 @@ pub(crate) fn relative_for_event(root: &Path, path: &Path) -> Option<String> {
     Some(text)
 }
 
+pub(crate) fn relative_path_text(path: &Path) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        path.to_string_lossy().into_owned()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        path.to_string_lossy().replace('\\', "/")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -419,10 +450,19 @@ mod tests {
             "../secret",
             "src/../secret",
             "src//secret",
-            "src\\/secret",
             "/root",
-            "\\root",
             "//server/share",
+            "src\0/secret",
+        ] {
+            assert!(
+                validate_relative(invalid).is_err(),
+                "expected invalid: {invalid}"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        for invalid in [
+            "src\\/secret",
+            "\\root",
             "C:/Windows",
             "file.txt:stream",
             "CON",

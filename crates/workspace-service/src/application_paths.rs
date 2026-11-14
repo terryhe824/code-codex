@@ -37,8 +37,8 @@ pub fn validate_directory_path(path: &Path) -> io::Result<()> {
 }
 
 pub fn validate_install_root(root: &Path) -> io::Result<PathBuf> {
-    validate_directory_path(root)?;
-    let marker = root.join(LAYOUT_FILE);
+    let marker = layout_marker_path(root);
+    validate_directory_path(marker.parent().expect("layout marker has a parent"))?;
     let meta = fs::symlink_metadata(&marker)?;
     #[cfg(windows)]
     {
@@ -55,6 +55,17 @@ pub fn validate_install_root(root: &Path) -> io::Result<PathBuf> {
         return Err(io::Error::other("Unsupported storage layout"));
     }
     Ok(root.to_path_buf())
+}
+
+fn layout_marker_path(root: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if root
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+    {
+        return root.join("Contents/Resources").join(LAYOUT_FILE);
+    }
+    root.join(LAYOUT_FILE)
 }
 
 #[cfg(windows)]
@@ -92,7 +103,7 @@ fn resolve_root(exe: Option<&Path>, registered: Option<&Path>) -> io::Result<Opt
     // Executable-relative resolution survives a missing registry locator.
     if let Some(exe) = exe {
         for root in exe.ancestors().skip(1).take(3) {
-            match fs::symlink_metadata(root.join(LAYOUT_FILE)) {
+            match fs::symlink_metadata(layout_marker_path(root)) {
                 Ok(_) => return validate_install_root(root).map(Some),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
@@ -101,7 +112,7 @@ fn resolve_root(exe: Option<&Path>, registered: Option<&Path>) -> io::Result<Opt
     }
     if let Some(root) = registered {
         // Old MSI registrations do not have the new marker yet.
-        match fs::symlink_metadata(root.join(LAYOUT_FILE)) {
+        match fs::symlink_metadata(layout_marker_path(root)) {
             Ok(_) => return validate_install_root(root).map(Some),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -125,6 +136,43 @@ fn resolve_root(exe: Option<&Path>, registered: Option<&Path>) -> io::Result<Opt
 }
 
 /// Bounded read-only location evidence; no paths, writes or permission claims.
+#[cfg(target_os = "macos")]
+pub fn diagnostic_status() -> serde_json::Value {
+    use serde_json::json;
+
+    let directories: Vec<_> = [
+        ("data", data_root()),
+        ("cache", plugin_root()),
+        ("runtime logs", log_root("runtime")),
+        ("diagnostics logs", log_root("diagnostics")),
+        ("install logs", log_root("install")),
+        ("update logs", log_root("update")),
+    ]
+    .into_iter()
+    .map(|(role, location)| {
+        let observation = match location.and_then(fs::symlink_metadata) {
+            Ok(_) => json!({"status":"observed"}),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => json!({"status":"missing"}),
+            Err(error) => json!({
+                "status":"unavailable",
+                "ioKind":format!("{:?}", error.kind()),
+                "osErrorCode":error.raw_os_error()
+            }),
+        };
+        json!({"role":role,"observation":observation})
+    })
+    .collect();
+    json!({
+        "status":"macOS user Library layout",
+        "centralized":false,
+        "readOnly":true,
+        "directories":directories,
+        "writePermission":"not tested"
+    })
+}
+
+/// Bounded read-only location evidence; no paths, writes or permission claims.
+#[cfg(not(target_os = "macos"))]
 pub fn diagnostic_status() -> serde_json::Value {
     use serde_json::json;
     match install_root() {
@@ -163,6 +211,7 @@ pub fn diagnostic_status() -> serde_json::Value {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn legacy_root() -> io::Result<PathBuf> {
     #[cfg(windows)]
     {
@@ -178,12 +227,38 @@ fn legacy_root() -> io::Result<PathBuf> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_library_root(directory: &str) -> io::Result<PathBuf> {
+    let base =
+        directories::BaseDirs::new().ok_or_else(|| io::Error::other("User home unavailable"))?;
+    let path = base
+        .home_dir()
+        .join("Library")
+        .join(directory)
+        .join("Code-Codex");
+    validate_directory_path(&path)?;
+    Ok(path)
+}
+
+#[cfg(target_os = "macos")]
+pub fn data_root() -> io::Result<PathBuf> {
+    macos_library_root("Application Support")
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn data_root() -> io::Result<PathBuf> {
     Ok(match install_root()? {
         Some(root) => root.join("data"),
         None => legacy_root()?,
     })
 }
+
+#[cfg(target_os = "macos")]
+pub fn plugin_root() -> io::Result<PathBuf> {
+    macos_library_root("Caches")
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn plugin_root() -> io::Result<PathBuf> {
     Ok(match install_root()? {
         Some(root) => root,
@@ -194,6 +269,13 @@ pub fn log_root(family: &str) -> io::Result<PathBuf> {
     if !matches!(family, "runtime" | "diagnostics" | "install" | "update") {
         return Err(io::Error::other("Unknown log family"));
     }
+    #[cfg(target_os = "macos")]
+    {
+        let path = macos_library_root("Logs")?.join(family);
+        validate_directory_path(&path)?;
+        Ok(path)
+    }
+    #[cfg(not(target_os = "macos"))]
     Ok(match install_root()? {
         Some(root) => root.join("logs").join(family),
         None => legacy_root()?.join(if family == "runtime" {
@@ -204,6 +286,9 @@ pub fn log_root(family: &str) -> io::Result<PathBuf> {
     })
 }
 pub fn temp_root() -> io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let path = macos_library_root("Caches")?.join("temp");
+    #[cfg(not(target_os = "macos"))]
     let path = match install_root()? {
         Some(root) => root.join("temp"),
         None => std::env::temp_dir().join("CodeCodex"),
@@ -216,10 +301,49 @@ pub fn temp_root() -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_user_storage_and_settings_live_under_their_library_directories() {
+        let home = directories::BaseDirs::new().expect("home directory");
+        assert_eq!(
+            data_root().expect("persistent data"),
+            home.home_dir()
+                .join("Library/Application Support/Code-Codex")
+        );
+        assert_eq!(
+            plugin_root().expect("downloaded plugins"),
+            home.home_dir().join("Library/Caches/Code-Codex")
+        );
+        assert_eq!(
+            log_root("runtime").expect("runtime logs"),
+            home.home_dir().join("Library/Logs/Code-Codex/runtime")
+        );
+        assert_eq!(
+            crate::SettingsStore::for_current_user()
+                .expect("settings")
+                .path(),
+            home.home_dir()
+                .join("Library/Application Support/Code-Codex/settings.json")
+        );
+        let diagnostic = diagnostic_status();
+        assert_eq!(diagnostic["readOnly"], true);
+        assert_eq!(diagnostic["directories"][0]["role"], "data");
+        assert!(
+            !diagnostic
+                .to_string()
+                .contains(home.home_dir().to_str().expect("home path"))
+        );
+    }
+
     #[test]
     fn layout_requires_product_schema_and_regular_marker() {
         let dir = tempfile::tempdir().expect("root");
-        let root = dir.path().join("中文 application");
+        let root = dir
+            .path()
+            .canonicalize()
+            .expect("canonical temp directory")
+            .join("中文 application");
         fs::create_dir(&root).expect("directory");
         assert!(validate_install_root(&root).is_err());
         fs::write(
@@ -235,6 +359,35 @@ mod tests {
         .expect("marker");
         assert!(validate_install_root(&root).is_err());
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_install_marker_lives_with_signed_bundle_resources() {
+        let temp = tempfile::tempdir().expect("fixture");
+        let root = temp
+            .path()
+            .canonicalize()
+            .expect("canonical fixture")
+            .join("移动 Code-Codex.app");
+        let resources = root.join("Contents/Resources");
+        fs::create_dir_all(&resources).expect("bundle resources");
+        fs::write(
+            resources.join(LAYOUT_FILE),
+            r#"{"schema":1,"product":"Code-Codex"}"#,
+        )
+        .expect("bundle marker");
+        let exe = root.join("Contents/MacOS/Code-Codex");
+        assert_eq!(
+            resolve_root(Some(&exe), None).expect("resolve bundle"),
+            Some(root.clone())
+        );
+
+        let elsewhere = root.with_extension("outside");
+        fs::rename(&resources, &elsewhere).expect("move marker directory");
+        std::os::unix::fs::symlink(elsewhere, &resources).expect("redirect resources");
+        assert!(validate_install_root(&root).is_err());
+        assert!(resolve_root(Some(&exe), None).is_err());
+    }
     #[test]
     fn rejects_relative_root_file_ancestor_and_unknown_log_family() {
         assert!(validate_directory_path(Path::new("relative")).is_err());
@@ -246,7 +399,11 @@ mod tests {
     #[test]
     fn missing_central_marker_never_forks_data_and_executable_marker_wins() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("app");
+        let root = temp
+            .path()
+            .canonicalize()
+            .expect("canonical temp directory")
+            .join("app");
         fs::create_dir_all(root.join("data")).unwrap();
         fs::create_dir(root.join("logs")).unwrap();
         assert!(
