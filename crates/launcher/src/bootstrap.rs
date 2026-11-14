@@ -59,16 +59,28 @@ struct BootstrapMetadata<'a> {
 /// Inventory only the verified installation's role names; never initialize accounts
 /// or execute official actions here. Renderer capability/response checks remain required.
 pub fn appearance_module_hints(executable: Option<&Path>) -> serde_json::Value {
-    let result = executable.ok_or("installation-unavailable").and_then(|p| {
-        let path=p.parent().ok_or("installation-parent")?.join("resources/app.asar");
-        read_appearance_modules(&path)
-    });
+    let result = executable
+        .ok_or("installation-unavailable")
+        .and_then(|path| app_asar_path(path).ok_or("installation-parent"))
+        .and_then(|path| read_appearance_modules(&path));
     let (value,stage)=match result {
         Ok(v)=>(v,"module-inventory"),
         Err(stage)=>(serde_json::json!({"schema":1,"initial":[],"appearance":[],"stage":stage}),stage),
     };
     crate::runtime_log::record("appearance","official module inventory",if stage=="module-inventory"{"discovered"}else{"unavailable"},serde_json::json!({"stage":stage,"initialCandidates":value["initial"].as_array().map(Vec::len).unwrap_or(0),"actionCandidates":value["appearance"].as_array().map(Vec::len).unwrap_or(0),"accountRuntimeRequired":false,"settingChanged":false}));
     value
+}
+
+pub(crate) fn app_asar_path(executable: &Path) -> Option<PathBuf> {
+    let parent = executable.parent()?;
+    #[cfg(target_os = "macos")]
+    if parent.file_name().is_some_and(|name| name == "MacOS") {
+        let contents = parent.parent()?;
+        if contents.file_name().is_some_and(|name| name == "Contents") {
+            return Some(contents.join("Resources/app.asar"));
+        }
+    }
+    Some(parent.join("resources/app.asar"))
 }
 
 /// Read only the installed main HTML and its numeric module entry, never all chunks.
@@ -258,6 +270,24 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn discovery_reads_appearance_inventory_from_macos_bundle_resources() {
+        let directory = TempDir::new().expect("temp dir");
+        let contents = directory.path().join("应用 副本.app/Contents");
+        let executable = contents.join("MacOS/Desktop Runner");
+        let resources = contents.join("Resources");
+        fs::create_dir_all(&resources).expect("bundle Resources");
+        fixture_asar(
+            &resources.join("app.asar"),
+            serde_json::json!({"app-initial-fixture.js":{"offset":"0","size":1}}),
+        );
+        assert_eq!(
+            appearance_module_hints(Some(&executable))["initial"],
+            serde_json::json!(["./assets/app-initial-fixture.js"])
+        );
+    }
 
     fn fixture_asar(path:&Path,entries:serde_json::Value) {
         let header=serde_json::to_vec(&serde_json::json!({"files":{"webview":{"files":{"assets":{"files":entries}}}}})).unwrap();

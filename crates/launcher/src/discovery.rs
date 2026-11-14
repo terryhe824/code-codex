@@ -1,11 +1,14 @@
-use std::collections::HashSet;
-use std::env;
+#[cfg(not(target_os = "macos"))]
+use std::{collections::HashSet, env};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::{Command, Stdio};
 
 #[cfg(windows)]
 use same_file::Handle as SameFileHandle;
-use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use serde::Deserialize;
+use serde::Serialize;
 use thiserror::Error;
 
 #[cfg(windows)]
@@ -33,7 +36,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     READ_CONTROL, WRITE_DAC,
 };
 
+#[cfg(windows)]
 use crate::process_guard::trusted_powershell;
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 #[derive(Debug, Clone, Error)]
 pub enum DiscoveryError {
@@ -117,6 +124,7 @@ pub struct CodexInstallation {
 pub enum DiscoverySource {
     Explicit,
     WindowsPackageManager,
+    MacApplication,
     UserInstall,
     Path,
 }
@@ -135,6 +143,8 @@ pub enum AppServerSourceKind {
 pub struct AppServerSource {
     executable: PathBuf,
     kind: AppServerSourceKind,
+    #[cfg(target_os = "macos")]
+    bundle_identity: Option<(PathBuf, String)>,
 }
 
 impl AppServerSource {
@@ -222,6 +232,7 @@ impl Drop for StagedAppServer {
     }
 }
 
+#[cfg(windows)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct PackageRecord {
@@ -241,6 +252,10 @@ pub fn discover_codex(
     preference: ChannelPreference,
 ) -> Result<CodexInstallation, DiscoveryError> {
     if let Some(executable) = explicit {
+        #[cfg(target_os = "macos")]
+        if macos::is_bundle_path(executable) && executable.is_dir() {
+            return macos::discover_bundle(executable, preference);
+        }
         let executable = canonical_executable(executable)?;
         return Ok(CodexInstallation {
             executable,
@@ -254,6 +269,15 @@ pub fn discover_codex(
         });
     }
 
+    #[cfg(target_os = "macos")]
+    return macos::discover(preference);
+
+    #[cfg(not(target_os = "macos"))]
+    discover_default(preference)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn discover_default(preference: ChannelPreference) -> Result<CodexInstallation, DiscoveryError> {
     let mut package_error = DiscoveryError::CodexNotFound;
     // AppX registration can be briefly unavailable while the official desktop
     // app updates. Retry discovery once before reporting a persistent failure.
@@ -279,6 +303,7 @@ pub fn discover_codex(
     discover_user_install(preference).ok_or(package_error)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn discover_windows_packages(
     preference: ChannelPreference,
 ) -> Result<Vec<CodexInstallation>, DiscoveryError> {
@@ -615,6 +640,7 @@ fn canonical_executable(path: &Path) -> Result<PathBuf, DiscoveryError> {
     Ok(canonical)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn discover_user_install(preference: ChannelPreference) -> Option<CodexInstallation> {
     let local = env::var_os("LOCALAPPDATA").map(PathBuf::from);
     let mut candidates = Vec::new();
@@ -673,39 +699,70 @@ pub fn discover_app_server_source(
         return Ok(AppServerSource {
             executable,
             kind: AppServerSourceKind::ExplicitDevelopmentOverride,
+            #[cfg(target_os = "macos")]
+            bundle_identity: None,
         });
     }
 
-    let Some(installation) = installation
-        .filter(|installation| installation.source == DiscoverySource::WindowsPackageManager)
-    else {
-        // User installs and PATH binaries have no package/publisher anchor. A
-        // caller can still authorize a development binary with --app-server.
-        return Err(DiscoveryError::AppServerNotFound);
-    };
-    let executable = installation
-        .app_server
-        .as_deref()
-        .ok_or(DiscoveryError::AppServerNotFound)
-        .and_then(|path| {
-            canonical_executable(path).map_err(|error| {
-                DiscoveryError::AppServerNotFound
-                    .context("discover_app_server_source", format!("cause={error}"))
-            })
-        })?;
-
     #[cfg(windows)]
-    if !is_windows_apps_anchor(&executable) {
-        return Err(DiscoveryError::AppServerNotFound);
+    {
+        let Some(installation) = installation
+            .filter(|installation| installation.source == DiscoverySource::WindowsPackageManager)
+        else {
+            // User installs and PATH binaries have no package/publisher anchor. A
+            // caller can still authorize a development binary with --app-server.
+            return Err(DiscoveryError::AppServerNotFound);
+        };
+        let executable = installation
+            .app_server
+            .as_deref()
+            .ok_or(DiscoveryError::AppServerNotFound)
+            .and_then(|path| {
+                canonical_executable(path).map_err(|error| {
+                    DiscoveryError::AppServerNotFound
+                        .context("discover_app_server_source", format!("cause={error}"))
+                })
+            })?;
+
+        if !is_windows_apps_anchor(&executable) {
+            return Err(DiscoveryError::AppServerNotFound);
+        }
+
+        Ok(AppServerSource {
+            executable,
+            kind: AppServerSourceKind::PackagedOfficial,
+        })
     }
-    #[cfg(not(windows))]
-    return Err(DiscoveryError::AppServerNotFound);
-
-    #[cfg(windows)]
-    Ok(AppServerSource {
-        executable,
-        kind: AppServerSourceKind::PackagedOfficial,
-    })
+    #[cfg(target_os = "macos")]
+    {
+        let installation = installation
+            .filter(|installation| installation.source == DiscoverySource::MacApplication)
+            .ok_or(DiscoveryError::AppServerNotFound)?;
+        let bundle = installation
+            .executable
+            .ancestors()
+            .nth(3)
+            .ok_or(DiscoveryError::AppServerNotFound)?;
+        let identifier = installation
+            .package_name
+            .as_deref()
+            .ok_or(DiscoveryError::AppServerNotFound)?;
+        let executable = installation
+            .app_server
+            .as_deref()
+            .ok_or(DiscoveryError::AppServerNotFound)?;
+        macos::verify_app_server(bundle, identifier, executable)?;
+        Ok(AppServerSource {
+            executable: executable.to_path_buf(),
+            kind: AppServerSourceKind::PackagedOfficial,
+            bundle_identity: Some((bundle.to_path_buf(), identifier.to_owned())),
+        })
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = installation;
+        Err(DiscoveryError::AppServerNotFound)
+    }
 }
 
 pub fn prepare_app_server_launch(
@@ -730,7 +787,17 @@ pub fn prepare_app_server_launch(
                 if let Some(stage) = &launch._stage { runtimes.insert(source.executable, std::sync::Arc::downgrade(stage)); }
                 Ok(launch)
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "macos")]
+            {
+                let (bundle, identifier) = source
+                    .bundle_identity
+                    .ok_or(DiscoveryError::AppServerNotFound)?;
+                macos::verify_app_server(&bundle, &identifier, &source.executable)?;
+                Ok(AppServerLaunch {
+                    executable: source.executable,
+                })
+            }
+            #[cfg(not(any(windows, target_os = "macos")))]
             {
                 Err(DiscoveryError::AppServerNotFound)
             }
@@ -1246,6 +1313,7 @@ fn sha256_reader(reader: &mut File) -> Result<[u8; 32], DiscoveryError> {
     Ok(hasher.finalize().into())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn find_on_path(names: &[&str]) -> Option<PathBuf> {
     let mut visited = HashSet::new();
     for directory in env::split_paths(&env::var_os("PATH")?) {

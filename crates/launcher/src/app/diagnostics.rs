@@ -1436,6 +1436,7 @@ pub(super) fn redacted_codex_diagnostic(installation: &CodexInstallation) -> Val
     let source = match installation.source {
         DiscoverySource::Explicit => "explicit",
         DiscoverySource::WindowsPackageManager => "windowsPackageManager",
+        DiscoverySource::MacApplication => "macApplication",
         DiscoverySource::UserInstall => "userInstall",
         DiscoverySource::Path => "path",
     };
@@ -1444,7 +1445,10 @@ pub(super) fn redacted_codex_diagnostic(installation: &CodexInstallation) -> Val
         "version": installation.version,
         "channel": installation.channel,
         "source": source,
-        "officialPackage": installation.source == DiscoverySource::WindowsPackageManager,
+        "officialPackage": matches!(
+            installation.source,
+            DiscoverySource::WindowsPackageManager | DiscoverySource::MacApplication
+        ),
         "packageName": installation.package_name,
         "packagedAppServer": installation.app_server.is_some()
     })
