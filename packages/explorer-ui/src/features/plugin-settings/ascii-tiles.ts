@@ -1,5 +1,5 @@
 import { ASCII_TILES_BACKGROUND_PLUGIN_ID as ID, DEFAULT_ASCII_TILES_SETTINGS, RANGES } from '../../effects/ascii-tiles/model';
-import {ParameterSettingsController,parameterCardMarkup,parameterPanelMarkup,type ParameterPanelConfig,type ParameterSettingsPorts} from './parameter-panel';
+import {ParameterSettingsController,parameterCardMarkup,parameterPanelMarkup,type ParameterPanelConfig,type ParameterSettingsPorts} from '../../components/parameter-panel';
 
 const groups = [
   ['Grid and motion','网格与流动',['speed','glyphSize','tileDensity','tileShear','tileGap','opacity','dpr','paused']],

@@ -29,7 +29,7 @@
 
 ## Task 1: 可复现构建与真实宿主能力检查
 
-**Files:** `scripts/macos/probe-host.py`、`scripts/macos/build.sh`、`artifacts/macos-port/`（证据，不入产品包）。
+**Files:** `scripts/macos/probe-host.py`、`scripts/build-macos.sh`、`artifacts/macos-port/`（证据，不入产品包）。
 **Interfaces:** 产出 JSON 能力报告（版本、CDP、目标页面、错误及隔离状态），不产出认证数据。构建产出 `target/debug/code-codex` 与现有 `packages/explorer-ui/dist/`。
 
 - [ ] 运行未修改的架构检查；安装缺少的 Rust 工具链与锁定 npm 依赖，记录原始失败。

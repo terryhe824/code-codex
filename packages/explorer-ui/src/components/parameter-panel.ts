@@ -1,8 +1,8 @@
-import {icons} from '../../icons';
-import type {BackgroundCommands} from '../../contracts/appearance';
-import type {DarkBackgroundPluginId} from '../../contracts/explorer-model';
-import {getLocale,subscribeLanguage} from '../../i18n';
-import {recordCaughtRuntimeError} from '../../runtime-operations';
+import {icons} from '../icons';
+import type {BackgroundCommands} from '../contracts/appearance';
+import type {DarkBackgroundPluginId} from '../contracts/explorer-model';
+import {getLocale,subscribeLanguage} from '../i18n';
+import {recordCaughtRuntimeError} from '../runtime-operations';
 const text=(en:string,zh:string)=>getLocale()==='zh-CN'?zh:en;
 export interface ParameterPanelConfig {id:DarkBackgroundPluginId;slug:string;prefix:string;nameEn:string;nameZh:string;groups:ReadonlyArray<readonly [string,string,readonly string[]]>;defaults:Record<string,number|string|boolean>;labels:Record<string,readonly [string,string,string?]>;ranges:Record<string,readonly [number,number,number]>;}
 export interface ParameterSettingsPorts {
