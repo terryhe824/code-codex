@@ -20,6 +20,10 @@ pub(crate) fn enabled()->bool {
 /// No host version/export allowlist. Require the official startup configuration
 /// mapping in a bounded trusted ASAR entry, and a launch-owned backend path.
 pub(crate) fn qualify(installation:&crate::discovery::CodexInstallation)->bool {
+ #[cfg(target_os = "macos")]
+ if installation.source != crate::discovery::DiscoverySource::MacApplication || installation.app_server.is_none() {return false;}
+ #[cfg(target_os = "macos")]
+ if std::env::var_os("CODEX_CLI_PATH").is_some(){return false;}
  if ["CODEX_APP_SERVER_OPENAI_BASE_URL","CODEX_APP_SERVER_CHATGPT_BASE_URL"].iter().any(|k|std::env::var_os(k).is_some()){return false;}
  (||->std::io::Result<bool>{
   use std::io::{Read,Seek,SeekFrom};
@@ -41,12 +45,22 @@ pub(crate) fn qualify(installation:&crate::discovery::CodexInstallation)->bool {
    if start.checked_add(size).is_none_or(|end|end>file.metadata().map(|m|m.len()).unwrap_or(0)){return Ok(false);}
    file.seek(SeekFrom::Start(start))?;let mut bytes=vec![0;size as usize];file.read_exact(&mut bytes)?;
    let source=String::from_utf8_lossy(&bytes);
-   if source.contains("CODEX_APP_SERVER_OPENAI_BASE_URL")&&source.contains("openai_base_url")&&source.contains("app-server")&&source.contains(".spawn"){return Ok(true);}
+   if source.contains("CODEX_APP_SERVER_OPENAI_BASE_URL")&&source.contains("openai_base_url")&&source.contains("app-server")&&source.contains(".spawn"){
+    #[cfg(target_os = "macos")]
+    if !source.contains("CODEX_CLI_PATH")||!source.contains("CODEX_APP_SERVER_FORCE_CLI"){continue;}
+    return Ok(true);
+   }
   } Ok(false)
  })().unwrap_or(false)
 }
 
 pub(crate) fn parameters(installation:&crate::discovery::CodexInstallation,renderer:CdpEndpoint,port:u16,native:bool)->Result<Value>{
+ #[cfg(target_os = "macos")]
+ let verified_backend=crate::discovery::discover_app_server_source(None, Some(installation))
+  .and_then(crate::discovery::prepare_app_server_launch).map_err(|_|error("backend-trust"))?;
+ #[cfg(target_os = "macos")]
+ let backend=verified_backend.executable();
+ #[cfg(not(target_os = "macos"))]
  let backend=installation.app_server.as_ref().ok_or_else(||error("backend-path"))?;
  let backend=dunce::canonicalize(backend).map_err(|_|error("backend-path"))?;
  let backend_size=crate::renderer_storage::regular(&backend).map_err(|_|error("backend-file"))?.len();
@@ -55,6 +69,28 @@ pub(crate) fn parameters(installation:&crate::discovery::CodexInstallation,rende
  let blocked=if native {std::collections::BTreeSet::new()}else{blocked_threads()?};
  Ok(json!({"schema":1,"rendererPort":renderer.port(),"port":port,"key":super::nonce(),"control":super::nonce(),"backend":backend,"backendSize":backend_size,"backendSha256":backend_sha256,"blocked":blocked}))
 }
+#[cfg(target_os = "macos")]
+pub(crate) fn apply_macos_launch(
+    command: &mut tokio::process::Command,
+    installation: &crate::discovery::CodexInstallation,
+    wrapper: &std::path::Path,
+    params: &Value,
+) -> Result<()> {
+    if installation.source != crate::discovery::DiscoverySource::MacApplication || !wrapper.is_absolute() {
+        return Err(error("unverified-macos-launch"));
+    }
+    let mut launch = params.clone();
+    launch["platform"] = json!("macos");
+    launch["officialExecutable"] = json!(installation.executable);
+    let start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_|error("launch-time"))?;
+    launch["launchedAfterMicros"] = json!(u64::try_from(start.as_micros()).map_err(|_|error("launch-time"))?);
+    command.env("CODEX_CLI_PATH", wrapper)
+        .env("CODEX_APP_SERVER_FORCE_CLI", "1")
+        .env(super::startup_backend::ENV, launch.to_string());
+    Ok(())
+}
+
 pub(super) fn blocked_threads()->Result<std::collections::BTreeSet<String>> {
  let mut blocked=std::collections::BTreeSet::new();
  let accounts=workspace_service::application_paths::data_root().map_err(|_|error("storage"))?.join("accounts");
@@ -75,8 +111,14 @@ pub(crate) fn save_descriptor(params:&Value,pid:u32)->Result<()> {
  use std::io::Write;
  let mut descriptor=params.clone();descriptor["pid"]=json!(pid);for key in ["blocked","backend","backendSize","backendSha256","manifest"]{descriptor.as_object_mut().unwrap().remove(key);}
  let path=descriptor_path()?;
+ let parent=path.parent().ok_or_else(||error("descriptor-parent"))?;
+ #[cfg(target_os = "macos")]
+ {
+  workspace_service::application_paths::validate_directory_path(parent).map_err(|_|error("descriptor-parent"))?;
+  std::fs::create_dir_all(parent).map_err(|_|error("descriptor-parent"))?;
+ }
  if path.exists(){crate::renderer_storage::regular(&path).map_err(|_|error("descriptor-file"))?;}
- let mut staged=tempfile::NamedTempFile::new_in(path.parent().ok_or_else(||error("descriptor-parent"))?).map_err(|_|error("descriptor-stage"))?;
+ let mut staged=tempfile::NamedTempFile::new_in(parent).map_err(|_|error("descriptor-stage"))?;
  // This rendezvous includes launch capabilities, never account tokens. Apply
  // the existing protected-DACL helper before writing any capability bytes.
  #[cfg(windows)]{
@@ -99,10 +141,37 @@ async fn descriptor(endpoint:CdpEndpoint)->Result<Option<Value>>{
  let Some(port)=v["port"].as_u64().and_then(|v|u16::try_from(v).ok()).filter(|v|*v>0)else{return Err(error("descriptor-port"))};
  for key in ["key","control"]{if !v[key].as_str().is_some_and(|s|s.len()==32&&s.bytes().all(|b|b.is_ascii_hexdigit())){return Err(error("descriptor-capability"));}}
  let broker_pid=v["brokerPid"].as_u64().and_then(|v|u32::try_from(v).ok()).unwrap_or(pid);
+ #[cfg(target_os = "macos")]
+ verify_macos_descriptor(&v,endpoint,pid,port,broker_pid).await?;
+ #[cfg(not(target_os = "macos"))]
  tokio::task::spawn_blocking(move||{crate::process_guard::verify_listener_owner_fast(endpoint.port(),pid,std::time::UNIX_EPOCH)?;crate::process_guard::verify_listener_owner_fast(port,broker_pid,std::time::UNIX_EPOCH)}).await.map_err(|_|error("owner-worker"))?.map_err(|_|error("listener-owner"))?;
  Ok(Some(v))
 }
-fn control_client()->Result<reqwest::Client>{reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(3)).build().map_err(|_|error("control-client"))}
+#[cfg(target_os = "macos")]
+async fn verify_macos_descriptor(
+    value: &Value, endpoint: CdpEndpoint, pid: u32, port: u16, broker_pid: u32,
+) -> Result<()> {
+    let start = value["launchedAfterMicros"].as_u64()
+        .and_then(|micros| std::time::UNIX_EPOCH.checked_add(Duration::from_micros(micros)))
+        .ok_or_else(|| error("descriptor-time"))?;
+    let official = value["officialExecutable"].as_str().map(std::path::PathBuf::from)
+        .ok_or_else(|| error("descriptor-image"))?;
+    let wrapper = value["brokerExecutable"].as_str().map(std::path::PathBuf::from)
+        .ok_or_else(|| error("descriptor-broker-image"))?;
+    let running = std::env::current_exe().map_err(|_| error("descriptor-broker-image"))?;
+    if value["platform"] != "macos" || pid == broker_pid || !official.is_absolute()
+        || wrapper != running || endpoint.port() == port {
+        return Err(error("descriptor-identity"));
+    }
+    tokio::task::spawn_blocking(move || {
+        let renderer = crate::process_guard::AttachedProcess::for_launched(pid, start, &official)?;
+        let broker = crate::process_guard::AttachedProcess::for_launched(broker_pid, start, &wrapper)?;
+        renderer.verify_listener(endpoint.port())?;
+        broker.verify_listener(port)
+    }).await.map_err(|_|error("owner-worker"))?.map_err(|_|error("listener-owner"))
+}
+
+fn control_client()->Result<reqwest::Client>{super::api::loopback_client(reqwest::Client::builder()).redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(3)).build().map_err(|_|error("control-client"))}
 async fn control(client:&reqwest::Client,v:&Value,payload:Value)->Result<Value>{
  let result=client.post(format!("http://localhost:{}/{}/control",v["port"].as_u64().unwrap(),v["key"].as_str().unwrap())).header("x-code-codex-control",v["control"].as_str().unwrap()).json(&payload).send().await.map_err(|_|error("control-send"))?;
  if !result.status().is_success(){return Err(error("control-rejected"));}
@@ -116,10 +185,17 @@ async fn ready_descriptor(endpoint:CdpEndpoint)->Result<Option<(Value,reqwest::C
  if status["schema"]!=1||status["pid"]!=v["pid"]||status["rendererPort"]!=endpoint.port()||status["ready"]!=true||!status["spawns"].as_u64().is_some_and(|v|v>0){return Err(error("backend-startup-unverified"));}
  Ok(Some((v,client)))
 }
-pub(crate) async fn verify_launch(endpoint:CdpEndpoint)->Result<bool>{
- let Some(v)=descriptor(endpoint).await?else{return Ok(false)};
- let client=control_client()?;
+pub(crate) async fn verify_launch(endpoint:CdpEndpoint, expected:&Value, launched_pid:u32)->Result<bool>{
  let started=std::time::Instant::now();
+ let v=loop {
+  if let Some(v)=descriptor(endpoint).await?{
+   if v["pid"]==launched_pid && v["key"]==expected["key"] && v["control"]==expected["control"] && v["port"]==expected["port"]{break v;}
+  }
+  #[cfg(target_os = "macos")]
+  if started.elapsed()<Duration::from_secs(15){tokio::time::sleep(Duration::from_millis(100)).await;continue;}
+  return Ok(false);
+ };
+ let client=control_client()?;
  let mut status=control(&client,&v,json!({"action":"status"})).await?;
  // Renderer CDP can be open before the desktop has requested its backend.
  // Observe the original native startup, not just a debugging-port milestone.
@@ -175,4 +251,76 @@ pub(super) async fn observe_transition(endpoint:CdpEndpoint,p:&Value,result:&Val
  let Some((v,client))=ready_descriptor(endpoint).await?else{return Ok(())};
  let reply=control(&client,&v,json!({"action":"native","thread":p["threadId"],"direct":p["baseUrl"].is_string()})).await?;
  if reply["accepted"]!=true{return Err(error("native-transition"));}Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_launch_tests {
+    use super::*;
+    use crate::discovery::{CodexInstallation, DiscoverySource};
+
+    fn fixture(source: DiscoverySource) -> CodexInstallation {
+        CodexInstallation {
+            executable: "/fixture/Official.app/Contents/MacOS/Official".into(),
+            version: "fixture".into(),
+            channel: "stable".into(),
+            source,
+            package_name: Some("com.openai.codex".into()),
+            package_full_name: None,
+            app_user_model_id: None,
+            app_server: Some("/fixture/Official.app/Contents/Resources/codex".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn macos_descriptor_rejects_reused_start_and_wrong_socket_owner() {
+        use std::io::{BufRead as _, Write as _};
+        use std::process::{Command, Stdio};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let broker_port = listener.local_addr().unwrap().port();
+        let mut renderer = Command::new("/usr/bin/perl")
+            .args(["-MIO::Socket::INET", "-e", r#"
+                $|=1;
+                my $listener=IO::Socket::INET->new(LocalAddr=>'127.0.0.1', LocalPort=>0,
+                    Proto=>'tcp', Listen=>1) or die $!;
+                print $listener->sockport, "\n";
+                <STDIN>;
+            "#])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut port = String::new();
+        std::io::BufReader::new(renderer.stdout.take().unwrap()).read_line(&mut port).unwrap();
+        let renderer_port = port.trim().parse().unwrap();
+        let endpoint = CdpEndpoint::loopback(renderer_port);
+        let broker_pid = std::process::id();
+        let renderer_pid = renderer.id();
+        let entry = json!({
+            "platform":"macos", "launchedAfterMicros":0, "officialExecutable":"/usr/bin/perl",
+            "brokerExecutable":std::env::current_exe().unwrap(),
+        });
+        let verified = verify_macos_descriptor(&entry, endpoint, renderer_pid, broker_port, broker_pid).await;
+        let mut stale = entry.clone();
+        stale["launchedAfterMicros"] = json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64);
+        let stale = verify_macos_descriptor(&stale, endpoint, renderer_pid, broker_port, broker_pid).await;
+        let swapped = verify_macos_descriptor(&entry, CdpEndpoint::loopback(broker_port), renderer_pid, renderer_port, broker_pid).await;
+        renderer.stdin.take().unwrap().write_all(b"exit\n").unwrap();
+        assert!(renderer.wait().unwrap().success());
+        assert!(verified.is_ok());
+        assert!(stale.is_err());
+        assert!(swapped.is_err());
+    }
+
+    #[test]
+    fn macos_launch_wires_only_the_verified_native_broker() {
+        let wrapper = std::path::Path::new("/fixture/Code-Codex");
+        let params = json!({"schema":1, "key":"synthetic"});
+        let mut command = tokio::process::Command::new("/fixture/Official");
+        assert!(apply_macos_launch(&mut command, &fixture(DiscoverySource::Explicit), wrapper, &params).is_err());
+        assert_eq!(command.as_std().get_envs().count(), 0);
+        apply_macos_launch(&mut command, &fixture(DiscoverySource::MacApplication), wrapper, &params).unwrap();
+        let env: std::collections::HashMap<_, _> = command.as_std().get_envs().collect();
+        assert_eq!(env[std::ffi::OsStr::new("CODEX_CLI_PATH")], Some(wrapper.as_os_str()));
+        assert_eq!(env[std::ffi::OsStr::new("CODEX_APP_SERVER_FORCE_CLI")], Some(std::ffi::OsStr::new("1")));
+        let config: Value = serde_json::from_str(env[std::ffi::OsStr::new(super::super::startup_backend::ENV)].unwrap().to_str().unwrap()).unwrap();
+        assert_eq!(config["officialExecutable"], "/fixture/Official.app/Contents/MacOS/Official");
+        assert_eq!(config["platform"], "macos");
+    }
 }

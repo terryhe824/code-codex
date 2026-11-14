@@ -126,16 +126,83 @@ fn parent_pid() -> u32 {
             parent
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: getppid has no preconditions.
+        unsafe { libc::getppid() as u32 }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         0
     }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_launch(p: &Value) -> Result<u32> {
+    use std::{
+        path::Path,
+        time::{Duration, UNIX_EPOCH},
+    };
+    let parent = parent_pid();
+    if p["platform"] != "macos" || parent <= 1 {
+        return Err(failure("launch-parent"));
+    }
+    let image = p["officialExecutable"]
+        .as_str()
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| failure("launch-image"))?;
+    let start = p["launchedAfterMicros"]
+        .as_u64()
+        .and_then(|value| UNIX_EPOCH.checked_add(Duration::from_micros(value)))
+        .ok_or_else(|| failure("launch-time"))?;
+    crate::process_guard::verify_process_identity(parent, start, image)
+        .map_err(|_| failure("launch-parent-identity"))?;
+    let app = image
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| failure("launch-app"))?;
+    let installation =
+        crate::discovery::discover_codex(Some(app), None, crate::discovery::ChannelPreference::Any)
+            .map_err(|_| failure("launch-app-trust"))?;
+    if installation.source != crate::discovery::DiscoverySource::MacApplication
+        || installation.executable != image
+        || installation.app_server.as_deref() != p["backend"].as_str().map(Path::new)
+    {
+        return Err(failure("launch-backend-trust"));
+    }
+    Ok(parent)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_macos_config(p: &Value) -> Result<()> {
+    if p["schema"] != 1
+        || !["rendererPort", "port"].iter().all(|key| {
+            p[*key]
+                .as_u64()
+                .is_some_and(|value| (1..=u16::MAX as u64).contains(&value))
+        })
+        || p["rendererPort"] == p["port"]
+        || !["key", "control"].iter().all(|key| {
+            p[*key].as_str().is_some_and(|value| {
+                value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        })
+    {
+        return Err(failure("launch-configuration"));
+    }
+    Ok(())
 }
 
 /// Called before Clap/logging; stdout remains exclusively official JSONL.
 pub(crate) async fn run(raw: std::ffi::OsString) -> Result<u8> {
     let mut p: Value = serde_json::from_str(&raw.to_string_lossy())
         .map_err(|_| failure("launch-configuration"))?;
+    #[cfg(target_os = "macos")]
+    let official = {
+        validate_macos_config(&p)?;
+        verify_macos_launch(&p)?
+    };
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let server = args.iter().any(|a| a == "app-server");
     let serving = server && !args.iter().any(|a| a == "--print-startup-config");
@@ -200,8 +267,14 @@ pub(crate) async fn run(raw: std::ffi::OsString) -> Result<u8> {
     let mut child = command.spawn().map_err(|_| failure("backend-spawn"))?;
     if let Some(listener) = listener {
         p["brokerPid"] = json!(std::process::id());
+        #[cfg(target_os = "macos")]
+        {
+            let wrapper = std::env::current_exe().map_err(|_| failure("broker-image"))?;
+            p["brokerExecutable"] = json!(wrapper);
+        }
+        #[cfg(not(target_os = "macos"))]
         let official = parent_pid();
-        if official == 0 {
+        if official <= 1 {
             return Err(failure("launch-parent"));
         }
         startup::save_descriptor(&p, official)?;
@@ -229,10 +302,14 @@ pub(crate) async fn run(raw: std::ffi::OsString) -> Result<u8> {
             }
         });
     }
-    let mut input = child.stdin.take().unwrap();
-    let mut output = child.stdout.take().unwrap();
+    let mut input = child.stdin.take().ok_or_else(|| failure("backend-input"))?;
+    let mut output = child
+        .stdout
+        .take()
+        .ok_or_else(|| failure("backend-output"))?;
     let stdin = tokio::spawn(async move {
         let _ = tokio::io::copy(&mut tokio::io::stdin(), &mut input).await;
+        let _ = input.shutdown().await;
     });
     let stdout = tokio::spawn(async move {
         let mut target = tokio::io::stdout();
@@ -290,7 +367,7 @@ fn control(s: &mut State, v: &Value, p: &Value, official: u32) -> Result<Value> 
     match v["action"].as_str() {
         Some("status") => {
             return Ok(
-                json!({"schema":1,"pid":official,"rendererPort":p["rendererPort"],"ready":true,"spawns":1,"enabled":s.enabled,"routeCount":s.routes.len(),"blockedCount":s.blocked.len()}),
+                json!({"schema":1,"pid":official,"rendererPort":p["rendererPort"],"ready":true,"failed":false,"spawns":1,"enabled":s.enabled,"routeCount":s.routes.len(),"blockedCount":s.blocked.len()}),
             );
         }
         Some("route") if thread.is_some() => {
@@ -566,4 +643,52 @@ async fn serve(
     };
     let mut disconnected = [0];
     tokio::select! {r=transfer=>r,_=reader.read(&mut disconnected)=>Ok(())}
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_broker_tests {
+    use super::*;
+
+    #[test]
+    fn native_control_status_satisfies_launch_confirmation() {
+        let mut state = State {
+            enabled: true,
+            ..State::default()
+        };
+        let status = control(
+            &mut state,
+            &json!({"action":"status"}),
+            &json!({"rendererPort":12345}),
+            42,
+        )
+        .unwrap();
+        assert_eq!(status["ready"], true);
+        assert_eq!(status["failed"], false);
+        assert_eq!(status["spawns"], 1);
+        assert_eq!(status["pid"], 42);
+        assert_eq!(status["rendererPort"], 12345);
+    }
+
+    #[test]
+    fn macos_broker_refuses_unbounded_or_ambiguous_launch_parameters() {
+        let valid = json!({"schema":1,"rendererPort":9292,"port":9293,"key":"01".repeat(16),"control":"23".repeat(16)});
+        assert!(validate_macos_config(&valid).is_ok());
+        for (key, value) in [
+            ("rendererPort", json!(9293)),
+            ("port", json!(65536)),
+            ("key", json!("bad")),
+            ("control", json!("xx".repeat(16))),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            assert!(validate_macos_config(&invalid).is_err());
+        }
+        assert!(verify_macos_launch(&valid).is_err());
+    }
+
+    #[test]
+    fn macos_broker_observes_its_actual_parent() {
+        assert!(parent_pid() > 1);
+        assert_ne!(parent_pid(), std::process::id());
+    }
 }

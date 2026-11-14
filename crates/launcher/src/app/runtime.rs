@@ -165,38 +165,45 @@ pub(super) async fn run(args: RunArgs) -> Result<(), AppError> {
     let windows_10 = needs_windows_10_surface_patch();
     let startup_route_requested=crate::accounts::startup::enabled();
     let startup_route_qualified=startup_route_requested&&crate::accounts::startup::qualify(&installation);
-    let mut startup_route_enabled=false;
-    let mut native_startup_route=false;
-    let request_main_inspector = if windows_10 || startup_route_qualified {
-        let image = installation.executable.clone();
-        let capability =
-            tokio::task::spawn_blocking(move || win10_compat::inspect_capability(&image)).await;
-        let request = capability
-            .as_ref()
-            .map_or(true, |c| c.should_request_inspector());
-        native_startup_route=startup_route_qualified&&installation.source==DiscoverySource::WindowsPackageManager&&capability.as_ref().is_ok_and(|c|c.state==win10_compat::InspectCapability::NativeChromium);
-        startup_route_enabled=startup_route_qualified&&(request||native_startup_route);
-        process_diagnostics::observe(
-            "Windows10 compatibility",
-            "official inspector capability",
-            if request {
-                "patch requested"
-            } else {
-                "opaque fallback"
-            },
-            json!({"officialVersion":installation.version,"capability":capability.as_ref().ok(),"workerFailed":capability.is_err(),"surfacePatchApplied":false,"requestMainInspector":request,"officialImageModified":false}),
-        );
-        record_startup_event(
-            "Windows10 compatibility",
-            if request {
-                "main inspector capability enabled or unknown; requesting surface patch"
-            } else {
-                "native runtime or disabled inspector; continuing without Electron surface patch or inspect-brk"
-            },
-        );
-        request
-    } else {
-        false
+    #[cfg(target_os = "macos")]
+    let (startup_route_enabled, native_startup_route, request_main_inspector) =
+        (startup_route_qualified, startup_route_qualified, false);
+    #[cfg(not(target_os = "macos"))]
+    let (startup_route_enabled, native_startup_route, request_main_inspector) = {
+        let mut startup_route_enabled=false;
+        let mut native_startup_route=false;
+        let request_main_inspector = if windows_10 || startup_route_qualified {
+            let image = installation.executable.clone();
+            let capability =
+                tokio::task::spawn_blocking(move || win10_compat::inspect_capability(&image)).await;
+            let request = capability
+                .as_ref()
+                .map_or(true, |c| c.should_request_inspector());
+            native_startup_route=startup_route_qualified&&installation.source==DiscoverySource::WindowsPackageManager&&capability.as_ref().is_ok_and(|c|c.state==win10_compat::InspectCapability::NativeChromium);
+            startup_route_enabled=startup_route_qualified&&(request||native_startup_route);
+            process_diagnostics::observe(
+                "Windows10 compatibility",
+                "official inspector capability",
+                if request {
+                    "patch requested"
+                } else {
+                    "opaque fallback"
+                },
+                json!({"officialVersion":installation.version,"capability":capability.as_ref().ok(),"workerFailed":capability.is_err(),"surfacePatchApplied":false,"requestMainInspector":request,"officialImageModified":false}),
+            );
+            record_startup_event(
+                "Windows10 compatibility",
+                if request {
+                    "main inspector capability enabled or unknown; requesting surface patch"
+                } else {
+                    "native runtime or disabled inspector; continuing without Electron surface patch or inspect-brk"
+                },
+            );
+            request
+        } else {
+            false
+        };
+        (startup_route_enabled, native_startup_route, request_main_inspector)
     };
     let main_inspector_reservation = if request_main_inspector {
         Some(PortReservation::reserve()?)
@@ -210,8 +217,15 @@ pub(super) async fn run(args: RunArgs) -> Result<(), AppError> {
     let main_inspector_endpoint = main_inspector_port.map(CdpEndpoint::loopback);
     let startup_route=if startup_route_enabled {
         let listener=PortReservation::reserve()?;let route_port=listener.port()?;
-        let mut params=crate::accounts::startup::parameters(&installation,endpoint,route_port,native_startup_route).map_err(|e|AppError::MainInspector{operation:"startup account transport configuration",details:e.message})?;
-        if native_startup_route {params["manifest"]=json!(installation.executable.parent().unwrap().parent().unwrap().join("AppxManifest.xml"));}
+        let params=crate::accounts::startup::parameters(&installation,endpoint,route_port,native_startup_route).map_err(|e|AppError::MainInspector{operation:"startup account transport configuration",details:e.message})?;
+        #[cfg(windows)]
+        let params = {
+            let mut params = params;
+            if native_startup_route {
+                params["manifest"] = json!(installation.executable.parent().unwrap().parent().unwrap().join("AppxManifest.xml"));
+            }
+            params
+        };
         listener.release();Some(params)
     }else{None};
     runtime_log::record("accounts","account.startup.configuration","prepared",json!({"requested":startup_route_requested,"qualified":startup_route_qualified,"enabled":startup_route.is_some(),"networkRequested":false,"officialImageModified":false}));
@@ -294,6 +308,14 @@ pub(super) async fn run(args: RunArgs) -> Result<(), AppError> {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        #[cfg(target_os = "macos")]
+        if let Some(params) = startup_route.as_ref() {
+            let wrapper = std::env::current_exe().map_err(|error| LaunchFailure::DirectSpawn {
+                os_code: error.raw_os_error(), kind: error.kind(),
+            })?;
+            crate::accounts::startup::apply_macos_launch(&mut command, &installation, &wrapper, params)
+                .map_err(|error| AppError::MainInspector {operation:"startup account transport configuration", details:error.message})?;
+        }
         CodexProcessGuard::spawn(command).map_err(|error| LaunchFailure::DirectSpawn {
             os_code: error.raw_os_error(),
             kind: error.kind(),
@@ -325,8 +347,20 @@ pub(super) async fn run(args: RunArgs) -> Result<(), AppError> {
         record_startup_event("CDP version", "waiting for renderer debugging endpoint");
         wait_for_launched_endpoint(endpoint, launched_pid, Duration::from_secs(30)).await?;
         record_startup_event("CDP version", "supported endpoint responded");
-        if startup_route_applied{
-            crate::accounts::startup::verify_launch(endpoint).await.map_err(|e|AppError::MainInspector{operation:"startup account transport verification",details:e.message})?;
+        if let Some(params) = startup_route.as_ref().filter(|_| startup_route_applied) {
+            let verified = crate::accounts::startup::verify_launch(endpoint, params, launched_pid)
+                .await.map_err(|error| AppError::MainInspector {
+                    operation: "startup account transport verification", details: error.message,
+                })?;
+            #[cfg(target_os = "macos")]
+            if !verified {
+                return Err(AppError::MainInspector {
+                    operation: "startup account transport verification",
+                    details: "The official app did not start the configured macOS account broker".into(),
+                });
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = verified;
         }
         if startup_enabled {
             record_startup_event("early startup animation", "concurrent supervisor continues through App Server preparation and renderer discovery");

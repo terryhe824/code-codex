@@ -66,4 +66,3 @@ class OwnedGroup:
             return child.wait(timeout=3)
         finally:
             self._events.close()
-
