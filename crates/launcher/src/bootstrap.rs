@@ -239,6 +239,15 @@ pub fn build_bootstrap(
             ),
         ));
     }
+    // macOS native settings live in the user's Library even when the
+    // launcher is run outside a packaged application.
+    #[cfg(target_os = "macos")]
+    let centralized_storage = workspace_service::application_paths::data_root().is_ok();
+    #[cfg(not(target_os = "macos"))]
+    let centralized_storage = workspace_service::application_paths::install_root()
+        .ok()
+        .flatten()
+        .is_some();
     let metadata = BootstrapMetadata {
         token: token.expose(),
         binding,
@@ -250,10 +259,7 @@ pub fn build_bootstrap(
         startup_splash_active,
         appearance_modules,
         language: crate::gui_support::localization::preference(),
-        centralized_storage: workspace_service::application_paths::install_root()
-            .ok()
-            .flatten()
-            .is_some(),
+        centralized_storage,
     };
     let metadata = serde_json::to_string(&metadata).map_err(|error| {
         BootstrapError::InvalidBundle.context("serializing bootstrap metadata", error)
@@ -352,6 +358,28 @@ mod tests {
         assert!(source.contains("location.protocol!=='app:'"));
         assert!(source.contains("location.host!=='-'"));
         assert!(!format!("{token:?}").contains(token.expose()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bootstrap_enables_native_storage_without_install_marker() {
+        let directory = TempDir::new().expect("temp dir");
+        let bundle = directory.path().join("explorer.js");
+        fs::write(&bundle, "window.__bundleLoaded=true;").expect("bundle");
+        let source = build_bootstrap(
+            &BundleSource::DevelopmentOverride(bundle),
+            &CapabilityToken::generate(),
+            PRIMARY_BINDING_NAME,
+            PRIMARY_RECEIVER_NAME,
+            "26.715.3651.0",
+            "stable",
+            true,
+            false,
+            false,
+            &serde_json::json!({}),
+        )
+        .expect("bootstrap");
+        assert!(source.contains("\"centralizedStorage\":true"));
     }
 
     #[test]
