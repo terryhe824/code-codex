@@ -103,7 +103,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unicode_working_directory_and_packaged_target_roundtrip() {
+    fn unicode_working_directory_roundtrip() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("中文 😀 مجلد");
         std::fs::create_dir(&directory).unwrap();
@@ -127,6 +127,20 @@ mod tests {
             let mut working = vec![0u16; 32768];
             link.GetWorkingDirectory(&mut working).unwrap();
             assert_eq!(text(&working), directory.to_string_lossy());
+        }
+        // Malformed files remain errors rather than becoming adoptable empty links.
+        let malformed = directory.join("invalid.lnk");
+        std::fs::write(&malformed, b"not a Shell link").unwrap();
+        assert!(inspect(&malformed).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires the official Codex AppX package installed on the Windows host"]
+    fn installed_codex_packaged_target_roundtrip() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = dunce::canonicalize(temporary.path()).unwrap();
+        let _apartment = Apartment::new().unwrap();
+        unsafe {
             // Use a real Shell namespace link, rather than substituting an EXE path
             // for the official packaged application's target contract.
             let mut id = std::ptr::null_mut();
@@ -154,9 +168,5 @@ mod tests {
                 "OpenAI.Codex_2p2nqsd0c76g0!App"
             );
         }
-        // Malformed files remain errors rather than becoming adoptable empty links.
-        let malformed = directory.join("invalid.lnk");
-        std::fs::write(&malformed, b"not a Shell link").unwrap();
-        assert!(inspect(&malformed).is_err());
     }
 }
