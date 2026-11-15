@@ -8,7 +8,7 @@
 
 - 用户暂时没有第二个测试账号；通过生产界面发起的子账号授权已取消。本轮未发送新的模型消息。空连接清理暴露了隔离测试 HOME 没有默认钥匙串引用的问题。启动器修复已提交 `b930ab7`，官方 CLI 和合成原生钥匙串测试均通过；真实用户的钥匙串偏好未变，也未复制凭证。独立实例已用修正后的启动器重开。
 - 官方模型菜单实测有 9 个模型选项，完成切换、关闭后重新打开及恢复原模型。收据 `artifacts/macos-port/live-model-menu.json`。早先测试错误地依赖按钮文案，保留失败收据，最终以重新打开后的原生菜单选中态核验。
-- 文件树的“在 Finder 中显示”已真实选中私有工作区的 `Hello.txt`。首次用户报告的 `NO_CONTEXT` 来自账号 `native.ensure`。测试启动器指定 `--workspace` 时，原生会话解析器未启动。官方后台以不读取回合正文的方式确认了指定测试会话的工作区路径。恢复原生会话解析后，一次拖入实际进入了消息输入框，文件未写入工作区。日志也出现另一次会话选择的解析失败。与生产参数一致的只读后台复验仍能解析已知成功的测试会话。前次收据为 `artifacts/macos-port/live-finder-import-manual.json`。最新物理拖入已确认落在文件树，前端 `getFileSecurityError` 在调用原生导入前返回 `ACCESS_DENIED`。文件树导入仍待修复和复验。
+- 文件树的“在 Finder 中显示”已真实选中私有工作区的 `Hello.txt`。首次用户报告的 `NO_CONTEXT` 来自账号 `native.ensure`。测试启动器指定 `--workspace` 时，原生会话解析器未启动。官方后台以不读取回合正文的方式确认了指定测试会话的工作区路径。恢复原生会话解析后，一次拖入实际进入了消息输入框，文件未写入工作区。日志也出现另一次会话选择的解析失败。与生产参数一致的只读后台复验仍能解析已知成功的测试会话。前次收据为 `artifacts/macos-port/live-finder-import-manual.json`。最新物理拖入已确认落在文件树，前端 `FileSystemFileHandle.getFile() SecurityError` 在调用原生导入前返回 `ACCESS_DENIED`。读取修复已提交，真实文件树导入等待复验，见末节。
 - 卸载失败恢复修复提交 `06799a8`。程序先暂存当前应用包及存在的上一版本，再撤销启动项和按需清除数据。不可变包导致暂存移动失败时，凭证尚未删除。暂存、撤销启动项或清除数据阶段失败时，程序尝试恢复已暂存的包，原位冲突时保留并报告副本。最终删除暂存目录在此恢复范围之外，已成功撤销的启动项和已删除的凭证与数据不会恢复。安装模块 11 项定向测试及独立复核通过，包含安装、回滚和卸载。完整 Rust 工作区 797 通过、0 失败、15 显式忽略。
 - 原生透明补充排查：官方宿主确有原生“半透明侧边栏”设置，但它是持久、配置级的 macOS vibrancy，受失焦和大窗口强制不透明策略影响。未找到单窗口清透背景及崩溃后精确恢复接口，不能将此设置计为 Windows 透明插件等价通过。
 - PowerPoint 在只读会话中能打开两页 PPTX；可写 `0600` 文件对照仍无法导出，保存命令无 PNG 产物，宏保护合同也未确认。用户明确允许改用 WPS。WPS 12.1.25895 已通过本地界面将旧版 PPT 导出为两张不同的 3840×2880 PNG，OCR 确认页序与内容，源文件哈希未变。收据位于 `artifacts/macos-port/office-probe/wps-legacy-ppt/receipt.json`。自动预览适配尚未通过：没有已验证的本地导出接口，AX 未提供文档完整路径，独立 PID 也未证明可隔离现有 WPS 配置，不能将手动导出等同于安全自动化。手动可用路径为 WPS「文件 → 输出为图片 → 逐页输出 → 所有页 → PNG」。
@@ -127,6 +127,14 @@
 ## 后续缺口修复构建
 
 - 核心源码 `06799a8`：完整 Rust 工作区 797 通过、0 失败、15 显式忽略；ARM64 核心、GUI 和 UI 构建通过。
-- 最新开发包目录 `artifacts/macos-arm64-gap-closure-20261115/` 包含 ad-hoc 签名 app、ZIP、DMG 及 `verification.json`。签名、归档完整性、ARM64 和最低系统版本声明检查通过。该包的核心另通过 10 项真实临时安装生命周期检查，日志 `artifacts/macos-port/gap-closure-lifecycle.log`。
-- 测试启动器修复 `b930ab7` 属于开发验收工具，不改变包内二进制。当前使用 session05 继续用户手动验收，日常客户端保持运行。
+- 该阶段开发包目录 `artifacts/macos-arm64-gap-closure-20261115/` 包含 ad-hoc 签名 app、ZIP、DMG 及 `verification.json`。签名、归档完整性、ARM64 和最低系统版本声明检查通过。该包的核心另通过 10 项真实临时安装生命周期检查，日志 `artifacts/macos-port/gap-closure-lifecycle.log`。
+- 测试启动器修复 `b930ab7` 属于开发验收工具，不改变包内二进制。session05 已正常关闭；当前使用 session06 继续手动验收，日常客户端保持运行。
 - 正式签名和公证脚本可准备并验证制品，真实 Apple 提交仍待条件具备。原生安装器尚未配置正式发布者信任，受管安装与升级、回滚、CLI 与图形卸载以及在 Finder 中显示已安装应用包均待用 Developer ID 制品验收。正式分发仍未完成。见 [macOS 正式分发说明](macos-release.md)。
+
+## Finder 拖入修复后的当前开发包
+
+- 包内源代码 `63e808a`，ARM64 核心、GUI、UI 类型检查和构建通过。最新目录为 `artifacts/macos-arm64-finder-fixed-20261115/`，包含 app、DMG、ZIP 和 `verification.json`。本轮没有生产 Rust 逻辑改动，前述 797 项 Rust 通过记录属于 `06799a8`，未在本轮重跑。
+- 新 app 及 ZIP 解压后的 app 均通过签名、ARM64、最低系统声明及存储布局校验；DMG 完整性和归档哈希已核对。仍是 ad-hoc 开发包，未公证。
+- 真实窗口在用户切换会话后，`explorer.context` 已返回 compatible=true。此次文件树拖入的失败来自 `FileSystemFileHandle.getFile()` 抛出的 `SecurityError`。修复优先读取 macOS 拖放事件提供的普通 File；目录缺少遍历接口时明确拒绝，避免把占位对象复制为空文件。
+- 修复通过 11 项定向测试、真实构造 FileList 的浏览器复现及 5 项原生导入恢复场景。后者覆盖提交响应丢失、刷新失败、会话切换、提交拒绝和上传失败，全部结束后无开放导入会话。真实 Finder 文件及目录拖入仍分别待验，不以夹具代替。
+- 发布准备脚本提交 `9adcf8b`，分发条件修正 `4ded3ee`。38 项 Python 广泛回归通过，最终标准标记的 5 项定向测试和分发状态的 15 项发布回归也通过。制品状态为 `notarized-artifacts`，机器记录保留 `unconfigured-native-release-trust` 分发阻塞；本机没有执行 Apple 提交。

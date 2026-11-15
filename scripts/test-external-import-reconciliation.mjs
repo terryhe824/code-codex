@@ -1,13 +1,22 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
+import {once} from 'node:events';
 import {createServer} from 'node:http';
 import {out,homeFixture,openBrowser,sleep,record} from './fixtures/browser-fixture.mjs';
 
 // Compile scripts/fixtures/import-reconciliation first. This uses the actual
 // Workspace ImportSession on a TempDir, never a user's filesystem or account.
 async function scenario(mode) {
- const child=spawn(path.join(out,'native/debug/import-reconciliation-fixture.exe'),[],{stdio:['pipe','pipe','pipe'],windowsHide:true});
+ const suffix=process.platform==='win32' ? '.exe' : '';
+ const fixturePath=path.join(out,'native','debug','import-reconciliation-fixture'+suffix);
+ const child=spawn(fixturePath,[],{stdio:['pipe','pipe','pipe'],windowsHide:true});
+ try {
+  await once(child,'spawn');
+ } catch (error) {
+  throw new Error('Could not start the native import fixture. Build scripts/fixtures/import-reconciliation into artifacts/import-reconciliation/native.',{cause:error});
+ }
+ const childClosed=new Promise(resolve=>child.once('close',resolve));
  let buffer='',pending=[];child.stdout.on('data',bytes=>{buffer+=bytes;while(buffer.includes('\n')){const n=buffer.indexOf('\n'),line=buffer.slice(0,n);buffer=buffer.slice(n+1);const p=pending.shift();if(p){clearTimeout(p.timer);p.resolve(JSON.parse(line));}}});
  const native=req=>new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('fixture timeout')),12000);pending.push({resolve,reject,timer});child.stdin.write(JSON.stringify(req)+'\n');});
  let commitSeen=false,queryHeldResolve;const actions=[];
@@ -31,10 +40,12 @@ async function scenario(mode) {
    res.end(JSON.stringify(result.ok?result.result:{id:q.id,ok:false,error:{code:'CONFLICT',message:'Synthetic state conflict'}}));
   }catch(error){res.statusCode=500;res.end(JSON.stringify({message:String(error)}));}
  });
- await new Promise(r=>server.listen(0,'127.0.0.1',r));const endpoint=`http://127.0.0.1:${server.address().port}/`;
- const html=homeFixture().replace('const errors=[];',`window.fixtureContext='thread_home_001';const originalRequest=window.__codeCodex.request;window.__codeCodex.request=async req=>{if(req.method==='explorer.context')window.fixtureContext=req.params.threadId;if(req.method.startsWith('explorer.entry.import.')||req.method==='explorer.list'){calls.push(req);return fetch(${JSON.stringify(endpoint)},{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...req,fixtureContext:window.fixtureContext})}).then(r=>r.json())}return originalRequest(req)};const errors=[];`);
- const browser=await openBrowser(html);
+ let browser;
  try{
+ await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
+ const endpoint=`http://127.0.0.1:${server.address().port}/`;
+ const html=homeFixture().replace('const errors=[];',`window.fixtureContext='thread_home_001';const originalRequest=window.__codeCodex.request;window.__codeCodex.request=async req=>{if(req.method==='explorer.context')window.fixtureContext=req.params.threadId;if(req.method.startsWith('explorer.entry.import.')||req.method==='explorer.list'){calls.push(req);return fetch(${JSON.stringify(endpoint)},{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...req,fixtureContext:window.fixtureContext})}).then(r=>r.json())}return originalRequest(req)};const errors=[];`);
+ browser=await openBrowser(html);
   await browser.wait(`[...document.querySelectorAll('*')].some(e=>/^code-codex-v/.test(e.localName)&&e.dataset.state==='empty')`,'empty workspace');
   await browser.ev(String.raw`window.tree=[...document.querySelectorAll('*')].find(e=>/^code-codex-v/.test(e.localName));tree.collapse(false);window.beforeCalls=calls.length;const transfer=new DataTransfer();transfer.items.add(new File(['committed payload\n'],'dropped.txt',{type:'text/plain'}));tree.shadowRoot.querySelector('.tree-shell').dispatchEvent(new DragEvent('drop',{bubbles:true,cancelable:true,composed:true,dataTransfer:transfer}));`);
   if(mode==='context-changed'){
@@ -55,7 +66,18 @@ async function scenario(mode) {
   if(mode==='upload-failed'){assert.equal(disk.commitCount,0);assert.ok(!observed.calls.includes('explorer.entry.import.commit'));assert.ok(!observed.calls.includes('explorer.list'));assert.match(observed.notice,/timed out/);}
   return {mode,status:'passed',disk,observed,actions};
  }finally{
-  releaseQuery();await browser.close();await new Promise(r=>server.close(r));child.stdin.end();await Promise.race([new Promise(r=>child.once('exit',r)),sleep(2000)]);if(child.exitCode===null)child.kill();
+  releaseQuery();
+  try{
+   await browser?.close();
+   if(server.listening) await new Promise(resolve=>server.close(resolve));
+  }finally{
+   child.stdin.end();
+   await Promise.race([childClosed,sleep(2000)]);
+   if(child.exitCode===null&&child.signalCode===null){
+    child.kill();
+    await childClosed;
+   }
+  }
  }
 }
 const results=[];
