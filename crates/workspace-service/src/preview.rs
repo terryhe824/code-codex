@@ -2666,7 +2666,21 @@ mod tests {
             .model_resource_info("scene.gltf", "first.bin", &model.version)
             .expect("resource");
 
-        fs::write(directory.path().join("first.bin"), b"other").expect("changed resource");
+        let resource_path = directory.path().join("first.bin");
+        let modified = fs::metadata(&resource_path)
+            .expect("resource metadata")
+            .modified()
+            .expect("resource timestamp");
+        fs::write(&resource_path, b"other").expect("changed resource");
+        // Versions are metadata-based. Two immediate same-length writes can
+        // share a Windows timestamp tick, so explicitly advance this fixture's
+        // metadata instead of relying on scheduler timing or adding a sleep.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&resource_path)
+            .expect("changed resource handle")
+            .set_times(fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(1)))
+            .expect("advance resource version");
         assert_eq!(
             workspace
                 .model_resource_chunk(ModelResourceChunkRequest {

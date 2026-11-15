@@ -107,6 +107,8 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("中文 😀 مجلد");
         std::fs::create_dir(&directory).unwrap();
+        // Shell expands the runner's 8.3 TEMP alias when serializing a link.
+        let directory = dunce::canonicalize(directory).unwrap();
         let target = directory.join("程序.exe");
         std::fs::write(&target, b"target fixture").unwrap();
         let path = directory.join("入口.lnk");

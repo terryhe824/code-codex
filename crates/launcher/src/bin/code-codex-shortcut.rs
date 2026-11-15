@@ -3159,6 +3159,38 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeShell;
 
+    // Exercise real COM link I/O and atomic replacement on clean Windows
+    // runners. Only the installed AppX icon lookup uses synthetic PNGs; these
+    // transaction tests do not certify discovery of the official package.
+    #[cfg(windows)]
+    struct NativeShellWithFixtureIcons(PlatformShortcutShell);
+
+    #[cfg(windows)]
+    impl ShortcutShell for NativeShellWithFixtureIcons {
+        fn inspect(&self, path: &Path) -> Result<ShortcutMetadata, IntegrationError> {
+            self.0.inspect(path)
+        }
+
+        fn create(
+            &self,
+            path: &Path,
+            target: &Path,
+            working_directory: &Path,
+            icon: &Path,
+            description: &str,
+        ) -> Result<(), IntegrationError> {
+            self.0.create(path, target, working_directory, icon, description)
+        }
+
+        fn replace_file(&self, staged: &Path, destination: &Path) -> Result<(), IntegrationError> {
+            self.0.replace_file(staged, destination)
+        }
+
+        fn official_icon_pngs(&self) -> Result<Vec<Vec<u8>>, IntegrationError> {
+            FakeShell.official_icon_pngs()
+        }
+    }
+
     impl ShortcutShell for FakeShell {
         fn inspect(&self, path: &Path) -> Result<ShortcutMetadata, IntegrationError> {
             let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
@@ -4648,12 +4680,15 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn real_windows_unicode_shortcuts_preserve_metadata_and_transactions() {
-        let shell = PlatformShortcutShell::new().expect("Windows Shell bridge");
+        let shell = NativeShellWithFixtureIcons(
+            PlatformShortcutShell::new().expect("Windows Shell bridge")
+        );
         let temporary = tempfile::tempdir().expect("isolated integration root");
+        let temporary_root = dunce::canonicalize(temporary.path()).expect("canonical fixture root");
         let executable = std::env::current_exe().expect("test executable");
         // Include characters outside both Chinese and Western ANSI code pages.
         for name in ["ascii", "中文 用户", "مجلد", "user-😀", "日本語-é"] {
-            let root = temporary.path().join(name);
+            let root = temporary_root.join(name);
             let install_root = root.join("安装 directory");
             let desktop = root.join("桌面 desktop");
             fs::create_dir_all(&install_root).unwrap();
@@ -4686,7 +4721,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn real_windows_shell_adopts_user_created_chatgpt_shortcut() {
-        let shell = PlatformShortcutShell::new().expect("Windows Shell bridge");
+        let shell = NativeShellWithFixtureIcons(
+            PlatformShortcutShell::new().expect("Windows Shell bridge")
+        );
         let temporary = tempfile::tempdir().expect("temporary integration root");
         let install_root = temporary.path().join("install");
         let desktop = temporary.path().join("desktop");
