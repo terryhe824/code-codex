@@ -32,7 +32,7 @@ jobs:
         shell: pwsh
         run: ./scripts/build.ps1 -Configuration Release -SkipUi
       - name: Full Windows workspace regression
-        run: cargo test --release --workspace --locked -- --test-threads=1
+        run: cargo test --release --workspace --locked --no-fail-fast -- --test-threads=1
       - name: Native recovery protocol and process-identity unit tests
         run: |
           cargo test --release --locked -p code-codex --bin code-codex startup_conflict:: -- --test-threads=1

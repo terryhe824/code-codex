@@ -2024,8 +2024,14 @@ mod tests {
             .expect("context");
         // The absolute root is sent once so the renderer can build absolute
         // paths locally (Copy Absolute Path) without a per-action round-trip.
-        let root = directory.path().to_string_lossy().to_string();
-        assert_eq!(response["rootPath"], json!(root));
+        let root = response["rootPath"].as_str().expect("rootPath string");
+        assert!(Path::new(root).is_absolute());
+        // Windows runners may create TempDir through an 8.3 alias, while the
+        // workspace reports its canonical long name. Compare resolved paths.
+        assert_eq!(
+            fs::canonicalize(root).expect("reported workspace"),
+            directory.path().canonicalize().expect("fixture workspace")
+        );
         // The display name must remain a leaf label, never the absolute path.
         assert_ne!(response["rootName"], json!(root));
         let root_name = response["rootName"].as_str().expect("rootName string");
@@ -3055,9 +3061,9 @@ mod tests {
         let relative = "folder with spaces/\u{6587}\u{4ef6}.txt";
         let expected = directory
             .path()
+            .join(relative)
             .canonicalize()
-            .expect("canonical workspace")
-            .join(relative);
+            .expect("reveal file");
         let captured = Arc::new(StdMutex::new(None::<std::path::PathBuf>));
         let opener_capture = captured.clone();
         let response = bridge
@@ -3068,10 +3074,13 @@ mod tests {
             .await
             .expect("reveal");
         assert_eq!(response, json!({ "revealed": true }));
-        assert_eq!(
-            lock_unpoisoned(&captured).as_deref(),
-            Some(expected.as_path())
-        );
+        let target = lock_unpoisoned(&captured)
+            .clone()
+            .expect("captured reveal target");
+        assert!(target.is_absolute());
+        // std canonicalization uses a verbatim Windows prefix; the native
+        // shell receives a normalized ordinary path to the same existing file.
+        assert_eq!(target.canonicalize().expect("captured file"), expected);
         assert!(
             !response
                 .to_string()
@@ -3866,7 +3875,17 @@ mod tests {
             .clone()
             .expect("current context");
         assert_eq!(context.thread_id.as_deref(), Some("thread-b"));
-        assert_eq!(context.workspace.root_path(), second_workspace.path());
+        assert_eq!(
+            context
+                .workspace
+                .root_path()
+                .canonicalize()
+                .expect("current workspace"),
+            second_workspace
+                .path()
+                .canonicalize()
+                .expect("second workspace")
+        );
         server.await.expect("server task");
     }
 }
