@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import pwd
 import re
 import signal
 import socket
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from xml.parsers.expat import ExpatError
 
 from owned_process import OwnedGroup
 from manual_session_control import COMMANDS, MAX_REPLY, SOCKET, ControlServer, private_root, request, start_background
@@ -89,6 +91,93 @@ def _isolated_env(home, codex):
     return env
 
 
+def _missing_default_keychain(result):
+    return (
+        result.returncode == 1
+        and not result.stdout
+        and result.stderr.strip()
+        == b'security: SecKeychainCopyDomainDefault user: A default keychain could not be found.'
+    )
+
+
+def _prepare_test_keychain(home):
+    home = private_root(home)
+    native_home = Path(pwd.getpwuid(os.geteuid()).pw_dir).resolve(strict=True)
+    if home == native_home:
+        raise ValueError('Keychain preferences require a private test home')
+
+    # Security.framework resolves its user-domain Keychain preferences through HOME.
+    # Reference the same native default without copying the Keychain database.
+    library = home / 'Library'
+    preferences = library / 'Preferences'
+    for directory in (library, preferences):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        entry = directory.lstat()
+        if not stat.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid() or entry.st_mode & 0o022:
+            raise ValueError('Keychain preferences must stay inside the private test home')
+    preference_file = preferences / 'com.apple.security.plist'
+    private_preferences = {}
+    try:
+        try:
+            fd = os.open(preference_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            pass
+        else:
+            with os.fdopen(fd, 'rb') as file:
+                entry = os.fstat(file.fileno())
+                if (not stat.S_ISREG(entry.st_mode) or entry.st_uid != os.geteuid()
+                        or entry.st_nlink != 1 or entry.st_mode & 0o022):
+                    raise ValueError('invalid private Keychain preference file')
+                private_preferences = plistlib.load(file)
+        if not isinstance(private_preferences, dict):
+            raise ValueError('invalid Keychain preference root')
+        for key in ('DefaultKeychain', 'LoginKeychain', 'DLDBSearchList'):
+            references = private_preferences.get(key, [])
+            if not isinstance(references, list) or any(not isinstance(item, dict) for item in references):
+                raise ValueError('invalid Keychain references')
+    except (OSError, ValueError, ExpatError, RecursionError):
+        raise RuntimeError('The private test home has unreadable or invalid Keychain preferences') from None
+
+    def default_keychain(user_home, *arguments):
+        return subprocess.run(
+            ['/usr/bin/security', 'default-keychain', '-d', 'user', *arguments],
+            env={'HOME': str(user_home), 'LC_ALL': 'C'}, stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=5,
+        )
+
+    native = default_keychain(native_home)
+    if native.returncode != 0:
+        if _missing_default_keychain(native):
+            # A broken preference can produce the same status as a missing
+            # default. Check for the file without reading the user's preferences.
+            try:
+                (native_home / 'Library/Preferences/com.apple.security.plist').lstat()
+            except FileNotFoundError:
+                return False
+            except OSError:
+                raise RuntimeError('The native Keychain preferences could not be checked') from None
+        raise RuntimeError('The native default Keychain could not be queried')
+    quoted_path = os.fsdecode(native.stdout.strip())
+    if not (quoted_path.startswith('"') and quoted_path.endswith('"')):
+        raise RuntimeError('The native default Keychain path could not be read')
+    keychain = Path(quoted_path[1:-1])
+    if not keychain.is_absolute() or not keychain.is_file():
+        raise RuntimeError('The native default Keychain file is unavailable')
+
+    isolated = default_keychain(home)
+    if isolated.returncode == 0:
+        if isolated.stdout != native.stdout:
+            raise RuntimeError('The private test home resolves a different default Keychain')
+        return True
+    if not _missing_default_keychain(isolated) or private_preferences.get('DefaultKeychain'):
+        raise RuntimeError('The private test home default Keychain could not be queried')
+    configured = default_keychain(home, '-s', str(keychain))
+    isolated = default_keychain(home)
+    if configured.returncode != 0 or isolated.returncode != 0 or isolated.stdout != native.stdout:
+        raise RuntimeError('The private test home could not resolve the native default Keychain')
+    return True
+
+
 def _require_exited(pid):
     if type(pid) is not int or not 1 < pid <= 2**31 - 1:
         raise ValueError('invalid prior process in session receipt')
@@ -135,7 +224,9 @@ def _resumed_launch(source, app, core):
     expected_paths = {'home': home, 'profile': profile, 'codexHome': codex, 'workspace': workspace}
     if any(state.get(key) != str(value) for key, value in expected_paths.items()):
         raise ValueError('prior session receipt does not match the private directories')
-    command = [str(core), 'run', '--codex-exe', str(app), '--workspace', str(workspace),
+    # The logged-in host supplies its workspace per conversation. An explicit
+    # workspace bypasses that resolver, which native account routing requires.
+    command = [str(core), 'run', '--codex-exe', str(app),
                '--codex-arg=--user-data-dir=' + str(profile), '--codex-arg=--no-first-run',
                '--allow-unsupported-version']
     return command, _isolated_env(home, codex)
@@ -209,10 +300,12 @@ def _resumed_controller(root, source, app, core):
             raise ValueError('another resumed run owns this private profile') from error
         command, env = _resumed_launch(source, app, core)
         _check_previous_resume(source)
+        keychain_available = _prepare_test_keychain(Path(env['HOME']))
         stopping = False
         run = None
         state = {'schema': 1, 'session': str(root), 'profileSession': str(source),
-                 'controllerPid': os.getpid(), 'control': str(root / SOCKET), 'status': 'starting'}
+                 'controllerPid': os.getpid(), 'control': str(root / SOCKET), 'status': 'starting',
+                 'nativeDefaultKeychainAvailable': keychain_available}
 
         def stop(*_):
             nonlocal stopping
@@ -302,6 +395,7 @@ def main():
     (workspace / 'Preview.md').write_text('# Mac acceptance\n\nA **synthetic** preview fixture.\n')
     (workspace / 'Table.csv').write_text('name,value\nalpha,1\nbeta,2\n')
     env = _isolated_env(home, codex)
+    keychain_available = _prepare_test_keychain(home)
     with socket.socket() as reservation:
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
@@ -310,7 +404,8 @@ def main():
              'home': str(home), 'codexHome': str(codex), 'profile': str(profile),
              'workspace': str(workspace), 'appVersion': info['CFBundleShortVersionString'],
              'controllerPid': os.getpid(), 'control': str(root / SOCKET),
-             'keychainScope': 'same OS user; separate application data is not a separate keychain'}
+             'keychainScope': 'same OS user; separate application data is not a separate keychain',
+             'nativeDefaultKeychainAvailable': keychain_available}
 
     def publish(status, **fields):
         state.update(status=status, **fields)

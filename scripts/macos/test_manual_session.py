@@ -3,6 +3,8 @@ import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import os
+import plistlib
+import pwd
 import runpy
 import signal
 import socket
@@ -11,7 +13,9 @@ import sys
 import tempfile
 from threading import Thread
 import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -163,6 +167,7 @@ while True:
         command, env = prepare(existing, app, Path("/synthetic/code-codex"))
         self.assertEqual(command[1:4], ["run", "--codex-exe", str(app)])
         self.assertIn(f"--codex-arg=--user-data-dir={existing / 'profile'}", command)
+        self.assertNotIn("--workspace", command, "Resume must enable per-conversation workspace resolution")
         self.assertEqual(env["HOME"], str(existing / "home"))
         self.assertEqual(env["CODEX_HOME"], str(existing / "codex"))
         self.assertEqual(env["CODEX_SQLITE_HOME"], str(existing / "codex"))
@@ -180,6 +185,116 @@ while True:
         (existing / "codex").symlink_to(existing / "home")
         with self.assertRaisesRegex(ValueError, "canonical"):
             prepare(existing, app, Path("/synthetic/code-codex"))
+
+    def test_private_home_resolves_native_default_without_changing_user_preferences(self):
+        def security(home, operation):
+            return subprocess.run(
+                ["/usr/bin/security", operation, "-d", "user"],
+                env={"HOME": str(home)}, capture_output=True, timeout=5,
+            )
+
+        native_home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        native_default = security(native_home, "default-keychain")
+        if native_default.returncode != 0:
+            self.skipTest("Requires a macOS user with a default Keychain")
+        native_list = security(native_home, "list-keychains").stdout
+        native_preferences = native_home / "Library/Preferences/com.apple.security.plist"
+
+        def preference_metadata():
+            try:
+                metadata = native_preferences.stat()
+            except FileNotFoundError:
+                return None
+            return metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
+
+        before = preference_metadata()
+        self.addCleanup(lambda: self.assertEqual(preference_metadata(), before))
+        self.addCleanup(lambda: self.assertEqual(security(native_home, "list-keychains").stdout, native_list))
+        self.addCleanup(lambda: self.assertEqual(security(native_home, "default-keychain").stdout, native_default.stdout))
+
+        home = self.root / "home"
+        home.mkdir(mode=0o700)
+        self.assertNotEqual(security(home, "default-keychain").returncode, 0)
+        preferences = home / "Library/Preferences/com.apple.security.plist"
+        preferences.parent.mkdir(parents=True)
+        preferences.write_bytes(plistlib.dumps({"DefaultKeychain": [], "FixtureSetting": True}))
+        prepare = runpy.run_path(str(CLI))["_prepare_test_keychain"]
+        prepare(home)
+        isolated_default = security(home, "default-keychain")
+        self.assertEqual(isolated_default.returncode, 0)
+        self.assertEqual(isolated_default.stdout, native_default.stdout)
+        self.assertTrue(plistlib.loads(preferences.read_bytes())["FixtureSetting"])
+        before_resume = preferences.stat().st_mtime_ns
+        prepare(home)
+        self.assertEqual(preferences.stat().st_mtime_ns, before_resume)
+
+    def test_private_keychain_setup_rejects_redirected_preferences(self):
+        home = self.root / "home"
+        outside = self.root / "outside"
+        (home / "Library").mkdir(parents=True, mode=0o700)
+        home.chmod(0o700)
+        outside.mkdir(mode=0o700)
+        (home / "Library/Preferences").symlink_to(outside, target_is_directory=True)
+        prepare = runpy.run_path(str(CLI))["_prepare_test_keychain"]
+        with self.assertRaisesRegex(ValueError, "preferences.*private"):
+            prepare(home)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_private_keychain_setup_preserves_invalid_or_unreadable_preferences(self):
+        home = self.root / "home"
+        home.mkdir(mode=0o700)
+        preferences = home / "Library/Preferences/com.apple.security.plist"
+        preferences.parent.mkdir(parents=True)
+        prepare = runpy.run_path(str(CLI))["_prepare_test_keychain"]
+        cases = (
+            (b"malformed preference data", 0o600),
+            (plistlib.dumps(["wrong root type"]), 0o600),
+            (plistlib.dumps({"DefaultKeychain": "wrong field type"}), 0o600),
+            (plistlib.dumps({"DefaultKeychain": []}), 0o000),
+        )
+        for contents, mode in cases:
+            with self.subTest(mode=mode, contents=contents[:8]):
+                preferences.write_bytes(contents)
+                preferences.chmod(mode)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "private test home.*Keychain preferences"):
+                        prepare(home)
+                finally:
+                    preferences.chmod(0o600)
+                self.assertEqual(preferences.read_bytes(), contents)
+
+    def test_keychain_setup_does_not_treat_lookup_errors_as_missing_defaults(self):
+        home = self.root / "home"
+        home.mkdir(mode=0o700)
+        prepare = runpy.run_path(str(CLI))["_prepare_test_keychain"]
+        keychain = self.root / "login.keychain-db"
+        keychain.touch()
+        native = subprocess.CompletedProcess([], 0, stdout=os.fsencode(f'    "{keychain}"\n'), stderr=b"")
+        error = subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"security: access denied")
+        missing = subprocess.CompletedProcess(
+            [], 1, stdout=b"",
+            stderr=b"security: SecKeychainCopyDomainDefault user: A default keychain could not be found.\n",
+        )
+        for replies, diagnostic in (((error,), "native"), ((native, error), "private test home")):
+            with self.subTest(diagnostic=diagnostic):
+                with patch.object(subprocess, "run", side_effect=(*replies, error, error)) as security:
+                    with self.assertRaisesRegex(RuntimeError, diagnostic):
+                        prepare(home)
+                self.assertEqual(len(replies), security.call_count)
+        native_home = self.root / "native-home"
+        native_home.mkdir(mode=0o700)
+        with patch.object(pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(native_home))):
+            with patch.object(subprocess, "run", return_value=missing) as security:
+                self.assertFalse(prepare(home))
+                security.assert_called_once()
+            native_preferences = native_home / "Library/Preferences/com.apple.security.plist"
+            native_preferences.parent.mkdir(parents=True)
+            native_preferences.write_bytes(b"ambiguous native preferences")
+            with patch.object(subprocess, "run", return_value=missing) as security:
+                with self.assertRaisesRegex(RuntimeError, "native"):
+                    prepare(home)
+                security.assert_called_once()
+            self.assertEqual(native_preferences.read_bytes(), b"ambiguous native preferences")
 
     def resumed_fixture(self):
         core = self.root / "fixture-core"
