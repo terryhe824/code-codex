@@ -484,40 +484,55 @@ fn uninstall_at(
                 ));
             }
         }
-        purge_vault(&paths[0])?;
     }
-    revoke_startup()?;
-    // Move only verified product bundles out of the Applications view before removing them.
+    // Retire both verified bundles before any irreversible credential deletion.
     let removed = tempfile::Builder::new()
         .prefix(".code-codex-remove-")
         .tempdir_in(parent)?;
-    let retired = removed.path().join(INSTALL_NAME);
-    rename(destination, &retired, libc::RENAME_EXCL)?;
-    if has_previous {
-        if let Err(error) = rename(
-            &previous,
-            &removed.path().join("previous.app"),
-            libc::RENAME_EXCL,
-        ) {
-            if let Err(restore_error) = rename(&retired, destination, libc::RENAME_EXCL) {
-                let recovery = removed.keep();
-                return Err(io::Error::other(format!(
-                    "{error}; restore failed ({restore_error}); bundle remains at {}",
-                    recovery.display()
-                )));
+    let bundles = [
+        (destination, removed.path().join(INSTALL_NAME)),
+        (previous.as_path(), removed.path().join("previous.app")),
+    ];
+    let bundles = &bundles[..1 + usize::from(has_previous)];
+    let mut staged = 0;
+    let outcome = (|| {
+        for (original, retired) in bundles {
+            rename(original, retired, libc::RENAME_EXCL)?;
+            staged += 1;
+        }
+        revoke_startup()?;
+        if purge {
+            purge_vault(&paths[0])?;
+            for path in paths {
+                if exists(&path)? {
+                    workspace_service::application_paths::validate_directory_path(&path)?;
+                    fs::remove_dir_all(path)?;
+                }
             }
+        }
+        Ok(())
+    })();
+    if let Err(error) = outcome {
+        let mut failures = Vec::new();
+        for (original, retired) in bundles[..staged].iter().rev() {
+            if let Err(restore_error) = rename(retired, original, libc::RENAME_EXCL) {
+                failures.push(format!(
+                    "could not restore {} ({restore_error}); bundle remains at {}",
+                    original.display(),
+                    retired.display()
+                ));
+            }
+        }
+        if failures.is_empty() {
             return Err(error);
         }
+        let _ = removed.keep();
+        return Err(io::Error::other(format!(
+            "{error}; {}",
+            failures.join("; ")
+        )));
     }
     removed.close()?;
-    if purge {
-        for path in paths {
-            if exists(&path)? {
-                workspace_service::application_paths::validate_directory_path(&path)?;
-                fs::remove_dir_all(path)?;
-            }
-        }
-    }
     Ok(json!({"uninstalled":true,"dataPurged":purge}))
 }
 
@@ -726,6 +741,150 @@ mod tests {
             fs::read_to_string(official.join("fixture")).unwrap(),
             "leave untouched"
         );
+    }
+
+    #[test]
+    fn mac_installation_preserves_credentials_when_login_revocation_fails() {
+        let temp = tempfile::TempDir::new_in("/private/tmp").unwrap();
+        let destination = fixture(temp.path(), "1.0.0", PRODUCT_ID);
+        let home = temp.path().join("synthetic home");
+        let credential = temp.path().join("synthetic credential");
+        fs::write(&credential, "preserve until login revocation succeeds").unwrap();
+
+        let error = uninstall_at(
+            &destination,
+            &home,
+            Some(PURGE_CONFIRMATION),
+            true,
+            || Err(io::Error::other("Fixture login revocation failed")),
+            |_| fs::remove_file(&credential),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "Fixture login revocation failed");
+        assert!(destination.is_dir());
+        assert!(credential.is_file(), "a failed removal deleted credentials");
+    }
+
+    #[test]
+    fn mac_installation_preserves_credentials_when_either_bundle_cannot_be_retired() {
+        let mut preserved = Vec::new();
+        for immutable_current in [true, false] {
+            let temp = tempfile::TempDir::new_in("/private/tmp").unwrap();
+            let destination = fixture(temp.path(), "1.1.0", PRODUCT_ID);
+            let backup = previous_path(&destination).unwrap();
+            fs::rename(fixture(temp.path(), "1.0.0", PRODUCT_ID), &backup).unwrap();
+            let immutable = if immutable_current {
+                &destination
+            } else {
+                &backup
+            };
+            let home = temp.path().join("synthetic home");
+            let credential = temp.path().join("synthetic credential");
+            fs::write(&credential, "preserve until both bundles are staged").unwrap();
+            let set_flag = |flag: &str| {
+                assert!(
+                    Command::new("/usr/bin/chflags")
+                        .arg(flag)
+                        .arg(immutable)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            };
+            set_flag("uchg");
+            let result = uninstall_at(
+                &destination,
+                &home,
+                Some(PURGE_CONFIRMATION),
+                true,
+                || Ok(()),
+                |_| fs::remove_file(&credential),
+            );
+            set_flag("nouchg");
+
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EPERM));
+            preserved.push(credential.is_file());
+            assert_eq!(verify_bundle(&destination, true).unwrap().version, "1.1.0");
+            assert_eq!(verify_bundle(&backup, true).unwrap().version, "1.0.0");
+        }
+        assert_eq!(
+            preserved,
+            [true, true],
+            "a failed retirement deleted credentials"
+        );
+    }
+
+    #[test]
+    fn mac_installation_restores_both_verified_bundles_when_vault_purge_fails() {
+        let temp = tempfile::TempDir::new_in("/private/tmp").unwrap();
+        let destination = fixture(temp.path(), "1.1.0", PRODUCT_ID);
+        let backup = previous_path(&destination).unwrap();
+        fs::rename(fixture(temp.path(), "1.0.0", PRODUCT_ID), &backup).unwrap();
+        let home = temp.path().join("synthetic home");
+        let data = data_paths(&home)[0].join("fixture.txt");
+        fs::create_dir_all(data.parent().unwrap()).unwrap();
+        fs::write(&data, "preserve").unwrap();
+
+        let result = uninstall_at(
+            &destination,
+            &home,
+            Some(PURGE_CONFIRMATION),
+            true,
+            || Ok(()),
+            |_| {
+                assert!(!destination.exists());
+                assert!(!backup.exists());
+                Err(io::Error::other("Fixture vault purge failed"))
+            },
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Fixture vault purge failed"
+        );
+        assert_eq!(fs::read_to_string(data).unwrap(), "preserve");
+        assert_eq!(verify_bundle(&destination, true).unwrap().version, "1.1.0");
+        assert_eq!(verify_bundle(&backup, true).unwrap().version, "1.0.0");
+    }
+
+    #[test]
+    fn mac_installation_keeps_signed_recovery_copy_if_restore_is_blocked() {
+        let temp = tempfile::TempDir::new_in("/private/tmp").unwrap();
+        let destination = fixture(temp.path(), "1.1.0", PRODUCT_ID);
+        let backup = previous_path(&destination).unwrap();
+        fs::rename(fixture(temp.path(), "1.0.0", PRODUCT_ID), &backup).unwrap();
+        let home = temp.path().join("synthetic home");
+
+        let result = uninstall_at(
+            &destination,
+            &home,
+            Some(PURGE_CONFIRMATION),
+            true,
+            || Ok(()),
+            |_| {
+                fs::create_dir(&destination)?;
+                Err(io::Error::other("Fixture vault purge failed"))
+            },
+        );
+
+        let diagnostic = result.unwrap_err().to_string();
+        let recovery = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".code-codex-remove-")
+            })
+            .expect("signed recovery directory");
+        let staged = recovery.join(INSTALL_NAME);
+        assert!(diagnostic.contains(&staged.display().to_string()));
+        assert!(diagnostic.contains("Fixture vault purge failed"));
+        assert_eq!(verify_bundle(&staged, true).unwrap().version, "1.1.0");
+        assert_eq!(verify_bundle(&backup, true).unwrap().version, "1.0.0");
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
     }
 
     #[test]
