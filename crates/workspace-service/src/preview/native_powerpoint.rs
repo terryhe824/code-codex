@@ -40,6 +40,8 @@ pub(super) struct NativePowerPointBundle {
 pub(super) enum NativePowerPointPreview {
     Rendered(NativePowerPointBundle),
     PowerpointUnavailable,
+    #[cfg(target_os = "macos")]
+    MacosFallback(super::NativePowerpointStatus),
     Embedded,
 }
 
@@ -323,6 +325,11 @@ pub(super) enum NativePowerPointExportAttemptError {
 #[derive(Debug)]
 pub(super) enum NativePowerPointRenderError {
     PowerpointUnavailable,
+    #[cfg(target_os = "macos")]
+    MacosFallback {
+        status: super::NativePowerpointStatus,
+        diagnostic: String,
+    },
     Failed(String),
 }
 
@@ -447,13 +454,19 @@ pub(super) fn run_native_powerpoint_export(
 fn macos_native_preview_unavailable(
     installation: Result<bool, String>,
 ) -> NativePowerPointRenderError {
+    use super::NativePowerpointStatus;
+
     match installation {
         Ok(false) => NativePowerPointRenderError::PowerpointUnavailable,
-        Ok(true) => NativePowerPointRenderError::Failed(
-            "PowerPoint found, but safe native automation capability is unverified on macOS"
+        Ok(true) => NativePowerPointRenderError::MacosFallback {
+            status: NativePowerpointStatus::AutomationUnqualified,
+            diagnostic: "PowerPoint found, but safe native automation capability is unverified on macOS"
                 .to_owned(),
-        ),
-        Err(error) => NativePowerPointRenderError::Failed(error),
+        },
+        Err(diagnostic) => NativePowerPointRenderError::MacosFallback {
+            status: NativePowerpointStatus::InstallationLookupFailed,
+            diagnostic,
+        },
     }
 }
 
@@ -677,6 +690,7 @@ pub(super) fn render_native_powerpoint_bundle(
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests {
     use super::*;
+    use crate::preview::NativePowerpointStatus;
 
     #[test]
     fn macos_native_preview_distinguishes_installed_unqualified_and_missing() {
@@ -686,11 +700,17 @@ mod macos_tests {
         ));
         assert!(matches!(
             macos_native_preview_unavailable(Ok(true)),
-            NativePowerPointRenderError::Failed(message) if message.contains("automation capability")
+            NativePowerPointRenderError::MacosFallback {
+                status: NativePowerpointStatus::AutomationUnqualified,
+                diagnostic,
+            } if diagnostic.contains("automation capability")
         ));
         assert!(matches!(
             macos_native_preview_unavailable(Err("PowerPoint installation detection timed out".to_owned())),
-            NativePowerPointRenderError::Failed(message) if message.contains("detection timed out")
+            NativePowerPointRenderError::MacosFallback {
+                status: NativePowerpointStatus::InstallationLookupFailed,
+                diagnostic,
+            } if diagnostic.contains("detection timed out")
         ));
     }
 

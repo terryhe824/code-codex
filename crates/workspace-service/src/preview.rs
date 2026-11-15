@@ -72,6 +72,13 @@ pub enum MediaPreviewNotice {
     PowerpointRequiredForFullFidelity,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativePowerpointStatus {
+    AutomationUnqualified,
+    InstallationLookupFailed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaInfo {
@@ -83,6 +90,9 @@ pub struct MediaInfo {
     pub chunk_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview_notice: Option<MediaPreviewNotice>,
+    /// Diagnostic status for the macOS native adapter when using the embedded preview.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_powerpoint_status: Option<NativePowerpointStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,7 +266,7 @@ impl Workspace {
     pub fn media_info(&self, relative_path: &str) -> Result<MediaInfo, WorkspaceError> {
         let (mut file, policy, size_bytes, version) = self.open_media(relative_path)?;
         let mut preview_notice = None;
-        if policy.signature == MediaSignature::Ppt
+        let native_powerpoint_status = if policy.signature == MediaSignature::Ppt
             && size_bytes >= MIN_NATIVE_POWERPOINT_SOURCE_BYTES
         {
             let clean = validate_relative(relative_path)?;
@@ -273,14 +283,20 @@ impl Workspace {
                         chunk_size,
                         chunk_count: rendered_size.div_ceil(chunk_size as u64),
                         preview_notice: None,
+                        native_powerpoint_status: None,
                     });
                 }
                 NativePowerPointPreview::PowerpointUnavailable => {
                     preview_notice = Some(MediaPreviewNotice::PowerpointRequiredForFullFidelity);
+                    None
                 }
-                NativePowerPointPreview::Embedded => {}
+                #[cfg(target_os = "macos")]
+                NativePowerPointPreview::MacosFallback(status) => Some(status),
+                NativePowerPointPreview::Embedded => None,
             }
-        }
+        } else {
+            None
+        };
         drop(file);
         self.ensure_root_valid()?;
         let chunk_size = MEDIA_CHUNK_BYTES;
@@ -293,6 +309,7 @@ impl Workspace {
             chunk_size,
             chunk_count,
             preview_notice,
+            native_powerpoint_status,
         })
     }
 
@@ -689,6 +706,11 @@ impl Workspace {
             Err(NativePowerPointRenderError::PowerpointUnavailable) => {
                 tracing::debug!("Microsoft PowerPoint is unavailable; using the embedded renderer");
                 NativePowerPointPreview::PowerpointUnavailable
+            }
+            #[cfg(target_os = "macos")]
+            Err(NativePowerPointRenderError::MacosFallback { status, diagnostic }) => {
+                tracing::debug!(?status, %diagnostic, "native PowerPoint preview is unavailable; using the embedded renderer");
+                NativePowerPointPreview::MacosFallback(status)
             }
             Err(NativePowerPointRenderError::Failed(error)) => {
                 tracing::debug!(%error, "native PowerPoint preview is unavailable; using the embedded renderer");
@@ -2261,6 +2283,7 @@ mod tests {
             chunk_size: 1,
             chunk_count: 1,
             preview_notice: Some(MediaPreviewNotice::PowerpointRequiredForFullFidelity),
+            native_powerpoint_status: None,
         };
 
         let serialized = serde_json::to_value(info).expect("serialize PowerPoint notice");
@@ -2268,6 +2291,51 @@ mod tests {
             serialized["previewNotice"],
             "powerpoint-required-for-full-fidelity"
         );
+        assert!(serialized.get("nativePowerpointStatus").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_legacy_powerpoint_media_keeps_the_native_fallback_reason() {
+        let (directory, workspace) = fixture();
+        let legacy = legacy_ppt(0xe391_c05f, None);
+        let mut compound = cfb::CompoundFile::open(Cursor::new(legacy)).expect("open synthetic PPT");
+        compound
+            .create_stream("/Fixture Padding")
+            .expect("create neutral padding stream")
+            .write_all(&[0; MIN_NATIVE_POWERPOINT_SOURCE_BYTES as usize])
+            .expect("write neutral padding stream");
+        let legacy = compound.into_inner().into_inner();
+        fs::write(directory.path().join("legacy.ppt"), &legacy).expect("write synthetic PPT");
+
+        let info = workspace
+            .media_info("legacy.ppt")
+            .expect("embedded media info");
+        let chunk = workspace
+            .media_chunk(
+                "legacy.ppt",
+                0,
+                info.chunk_size,
+                info.size_bytes,
+                &info.version,
+            )
+            .expect("embedded media bytes");
+        assert_eq!(chunk.data, legacy);
+        assert!(chunk.eof);
+        assert_eq!(info.mime_type, "application/vnd.ms-powerpoint");
+        let payload = serde_json::to_value(info).expect("serialize embedded media info");
+        if payload["previewNotice"] == "powerpoint-required-for-full-fidelity" {
+            assert!(payload.get("nativePowerpointStatus").is_none());
+        } else {
+            assert!(payload.get("previewNotice").is_none());
+            assert!(
+                matches!(
+                    payload["nativePowerpointStatus"].as_str(),
+                    Some("automation-unqualified" | "installation-lookup-failed")
+                ),
+                "missing native preview status in {payload}"
+            );
+        }
     }
 
     #[test]
