@@ -50,7 +50,7 @@ jobs:
             security delete-keychain "$RUNNER_TEMP/code-codex-tests.keychain-db"
           fi
       - name: Shared architecture and file contracts
-        run: node --test scripts/test-refactor-contracts.mjs scripts/test-plugin-publication.mjs scripts/test-maintenance-isolation.mjs scripts/test-file-mutation-isolation.mjs scripts/test-macos-file-names.mjs
+        run: node --test scripts/test-refactor-contracts.mjs scripts/test-plugin-publication.mjs scripts/test-maintenance-isolation.mjs scripts/test-file-mutation-isolation.mjs scripts/test-macos-file-names.mjs scripts/test-browser-fixture-port.mjs
       - name: Build local development package
         run: python3 scripts/macos/package.py --binary target/debug/code-codex --output artifacts/macos-ci --version "$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "code-codex"))')"
       - name: Native install, upgrade and rollback acceptance

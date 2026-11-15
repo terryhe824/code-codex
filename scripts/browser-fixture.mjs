@@ -1,5 +1,5 @@
 import {spawn} from 'node:child_process';
-import {mkdtempSync,readFileSync,rmSync,existsSync} from 'node:fs';
+import {mkdtempSync,readFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve,sep} from 'node:path';
 import {env,platform} from 'node:process';
@@ -7,13 +7,37 @@ export const delay=ms=>new Promise(r=>setTimeout(r,ms));
 export const fixtureChromePath = env.CHROME_PATH ?? (platform === 'darwin'
   ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
   : 'C:/Program Files/Google/Chrome/Application/chrome.exe');
+export function readFixturePort(file, read=readFileSync){
+  let contents;
+  try { contents=read(file,'utf8'); }
+  catch(error){
+    if(['ENOENT','EBUSY','EPERM'].includes(error.code))return null;
+    throw error;
+  }
+  // Existence is not readiness: Chrome can hold a Windows write lock or
+  // publish only part of the port before completing its first line.
+  const match=/^(\d+)\r?\n/.exec(contents);
+  if(!match)return null;
+  const port=Number(match[1]);
+  return Number.isInteger(port)&&port>0&&port<=65535 ? port : null;
+}
 export async function launchFixture(url){
   const profile=mkdtempSync(join(tmpdir(),'code-codex-package-test-'));
   const chrome=fixtureChromePath;
   const process=spawn(chrome,['--headless=new','--no-sandbox','--disable-gpu','--enable-unsafe-swiftshader','--autoplay-policy=no-user-gesture-required','--window-size=1500,1000','--remote-debugging-port=0',`--user-data-dir=${profile}`,url],{stdio:'ignore',windowsHide:true});
   let socket;let sequence=0;const pending=new Map();
-  for(let i=0;i<200&&!existsSync(join(profile,'DevToolsActivePort'));i++)await delay(50);
-  const port=readFileSync(join(profile,'DevToolsActivePort'),'utf8').split('\n')[0];
+  let port=null;
+  try {
+    for(let i=0;i<200;i++){
+      port=readFixturePort(join(profile,'DevToolsActivePort'));
+      if(port!==null)break;
+      await delay(50);
+    }
+    if(port===null)throw Error('Fixture browser did not publish a readable DevTools port');
+  } catch(error){
+    if(process.exitCode===null)process.kill();
+    throw error;
+  }
   const targets=await(await fetch(`http://127.0.0.1:${port}/json/list`)).json();
   const page=targets.find(t=>t.type==='page');
   socket=new WebSocket(page.webSocketDebuggerUrl);
