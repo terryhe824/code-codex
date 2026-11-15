@@ -313,6 +313,9 @@ runTypeahead(character: string): void {
     this.host.announce(next? (matches===1? "1 loaded item matches":`${matches} loaded items match`):"File filter cleared");
   }
   onFileFilterKeyDown(event: KeyboardEvent): void {
+    // Candidate navigation/cancellation belongs to the input method, including
+    // the final composition key reported as keyCode 229 by some browsers.
+    if(event.isComposing||event.keyCode===229) return;
     if(event.key==="ArrowDown"&&this.rows.length>0) {
       event.preventDefault();
       this.focusIndex(0);

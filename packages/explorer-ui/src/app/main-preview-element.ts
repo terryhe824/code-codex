@@ -1557,6 +1557,8 @@ export class CodeCodexMainPreviewElement extends HTMLElement {
   }
 
   _onShadowKeyDown(event: KeyboardEvent): void {
+    // Do not navigate away from, or save, a draft while an IME owns this key.
+    if (event.isComposing || event.keyCode === 229) return;
     if (
       this._state.editor &&
       event.key.toLocaleLowerCase() === "s" &&
