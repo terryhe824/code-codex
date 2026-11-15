@@ -8,7 +8,7 @@ const result = await build({
   stdin: {
     contents: `
       export {contextActionError,entryNameValidationError} from "./features/file-operations/context-menu";
-      export {ensureDistinctExternalRootNames,externalImportError,normalizeExternalDropReadError} from "./features/file-operations/external-import";
+      export {captureExternalDropCandidates,ensureDistinctExternalRootNames,externalImportError,normalizeExternalDropReadError,resolveExternalDropRoots} from "./features/file-operations/external-import";
       export {editSaveError} from "./features/preview/responses";
       export {PreviewWorkspaceController} from "./features/workspace/preview-workspace";
       export {joinAbsolutePath} from "./core/bridge/response-validation";
@@ -25,7 +25,7 @@ const result = await build({
   format: 'esm',
   write: false,
 });
-const {contextActionError, editSaveError, entryNameValidationError, ensureDistinctExternalRootNames, externalImportError, normalizeExternalDropReadError, PreviewWorkspaceController, TreeModel, joinAbsolutePath} = await import(
+const {captureExternalDropCandidates, contextActionError, editSaveError, entryNameValidationError, ensureDistinctExternalRootNames, externalImportError, normalizeExternalDropReadError, PreviewWorkspaceController, resolveExternalDropRoots, TreeModel, joinAbsolutePath} = await import(
   'data:text/javascript;base64,' + Buffer.from(result.outputFiles[0].text + '\n//# sourceURL=macos-file-names-test-bundle.js').toString('base64')
 );
 
@@ -53,6 +53,81 @@ test('platform file actions preserve access-denied errors and saved drafts', asy
       assert.equal(editSaveError(permission), `${os} denied permission to save this file. Your draft has been kept.`);
     });
   }
+});
+
+test('macOS drop uses Files granted by Finder without opening the modern handle', async () => {
+  await withPlatform('MacIntel', async () => {
+    const file = new File(['test bytes'], 'Finder 导入验收.txt');
+    let handleReads = 0;
+    const item = {
+      kind: 'file',
+      getAsFile: () => null,
+      getAsFileSystemHandle: async () => ({
+        kind: 'file',
+        name: file.name,
+        getFile() {
+          handleReads += 1;
+          throw new DOMException('FileSystemFileHandle.getFile is unavailable', 'SecurityError');
+        },
+      }),
+    };
+    // A transfer can include string items. Its FileList contains only file entries.
+    const candidates = captureExternalDropCandidates({items: [{kind: 'string'}, item], files: [file]});
+    const [root] = await resolveExternalDropRoots(candidates, () => {});
+    assert.equal(root.name, file.name);
+    assert.equal(await root.file.text(), 'test bytes');
+    assert.equal(handleReads, 0);
+    await assert.rejects(
+      resolveExternalDropRoots(captureExternalDropCandidates({items: [item], files: []}), () => {}),
+      {code: 'ACCESS_DENIED'}
+    );
+  });
+});
+
+test('macOS drop still traverses directory handles when a File is also exposed', async () => {
+  await withPlatform('MacIntel', async () => {
+    const placeholder = new File([], 'folder');
+    const nested = new File(['test bytes'], 'nested.txt');
+    const item = {
+      kind: 'file',
+      getAsFile: () => placeholder,
+      getAsFileSystemHandle: async () => ({
+        kind: 'directory',
+        name: 'folder',
+        async *entries() {
+          yield [nested.name, {kind: 'file', name: nested.name, getFile: async () => nested}];
+        },
+      }),
+    };
+    const [root] = await resolveExternalDropRoots(
+      captureExternalDropCandidates({items: [item], files: [placeholder]}), () => {},
+    );
+    assert.equal(root.kind, 'directory');
+    assert.equal(root.members[0].relativePath, nested.name);
+    assert.equal(await root.members[0].file.text(), 'test bytes');
+  });
+});
+
+test('macOS rejects a known directory when traversal is unavailable', async () => {
+  await withPlatform('MacIntel', async () => {
+    const placeholder = new File([], 'unreadable-folder');
+    const item = {
+      kind: 'file',
+      getAsFile: () => null,
+      getAsFileSystemHandle: async () => ({kind: 'directory', name: placeholder.name}),
+    };
+    const candidates = captureExternalDropCandidates({items: [item], files: [placeholder]});
+    await assert.rejects(resolveExternalDropRoots(candidates, () => {}), {code: 'ACCESS_DENIED'});
+
+    const emptyFile = new File([], 'empty.txt');
+    const regular = {...item, getAsFileSystemHandle: async () => ({kind: 'file', name: emptyFile.name})};
+    const [root] = await resolveExternalDropRoots(
+      captureExternalDropCandidates({items: [regular], files: [emptyFile]}), () => {},
+    );
+    assert.equal(root.kind, 'file');
+    assert.equal(root.file, emptyFile);
+    assert.equal(root.sizeBytes, 0);
+  });
 });
 
 async function withPlatform(platform, callback) {

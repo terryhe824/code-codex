@@ -21,8 +21,10 @@ export function isExternalFileDrag(dataTransfer: DataTransfer|null): boolean {
 export function captureExternalDropCandidates(dataTransfer: DataTransfer|null): readonly ExternalDropCandidate[] {
   if(!dataTransfer) return [];
   const candidates: ExternalDropCandidate[]=[];
-  for(const rawItem of Array.from(dataTransfer.items)) {
-    if(rawItem.kind!=="file") continue;
+  const fileItems=Array.from(dataTransfer.items).filter((item) => item.kind==="file");
+  const fileList=isMacOs()? Array.from(dataTransfer.files):undefined;
+  const matchedFiles=fileList?.length===fileItems.length? fileList:undefined;
+  for(const [index,rawItem] of fileItems.entries()) {
     const item=rawItem as ExternalDataTransferItem;
     let handlePromise: Promise<FileSystemHandle|null>|undefined;
     try {
@@ -52,6 +54,7 @@ export function captureExternalDropCandidates(dataTransfer: DataTransfer|null): 
 
       file=undefined;
     }
+    file??=matchedFiles?.[index];
     if(handlePromise||entry||file) {
       candidates.push({
         ...(handlePromise? { handlePromise }:{}),
@@ -62,7 +65,7 @@ export function captureExternalDropCandidates(dataTransfer: DataTransfer|null): 
   }
 
   if(candidates.length) return candidates;
-  return Array.from(dataTransfer.files,(file) => ({ file }));
+  return (fileList??Array.from(dataTransfer.files)).map((file) => ({ file }));
 }
 
 
@@ -77,13 +80,25 @@ export async function resolveExternalDropRoots(
       assertCurrent();
       const handle=candidate.handlePromise? await candidate.handlePromise.catch(() => null):null;
       assertCurrent();
-      if(handle&&(handle.kind!=="directory"||typeof (handle as ExternalDirectoryHandle).entries==="function")) {
-        roots.push(await externalDropRootFromHandle(handle,budget,assertCurrent));
-        continue;
+      // Finder may supply a readable File even when the embedded renderer
+      // cannot open a FileSystemFileHandle. A directory still needs traversal.
+      const macDirectory=isMacOs()&&(handle?.kind==="directory"||candidate.entry?.isDirectory);
+      const preferDirectFile=isMacOs()&&candidate.file&&!macDirectory;
+      if(!preferDirectFile) {
+        const usableHandle=handle&&(handle.kind==="directory"
+          ? typeof (handle as ExternalDirectoryHandle).entries==="function"
+          : !macDirectory);
+        if(handle&&usableHandle) {
+          roots.push(await externalDropRootFromHandle(handle,budget,assertCurrent));
+          continue;
+        }
+        if(candidate.entry&&(!macDirectory||candidate.entry.isDirectory)) {
+          roots.push(await externalDropRootFromEntry(candidate.entry,budget,assertCurrent));
+          continue;
+        }
       }
-      if(candidate.entry) {
-        roots.push(await externalDropRootFromEntry(candidate.entry,budget,assertCurrent));
-        continue;
+      if(macDirectory) {
+        throw new ExplorerBridgeError({ code: "ACCESS_DENIED",message: "A dropped folder could not be read." });
       }
       if(candidate.file) {
         chargeExternalDropFile(candidate.file.name,candidate.file.size,1,budget);
