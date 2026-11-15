@@ -1,10 +1,14 @@
 # Code-Codex macOS 开发版
 
-此分支适配 Apple Silicon。目标是 Windows 基线的完整功能；当前仍处于实施和验收阶段，不能视为完整复刻的正式发布版。已测主机为 macOS 27.2.1，官方应用 26.1111.21308；其他 macOS 版本尚未实测。
+此分支适配 Apple Silicon。目标是 Windows 基线的完整功能；当前仍处于开发包验收阶段，不能视为完整复刻的正式发布版。真实宿主已测 macOS 27.2.1、官方应用 26.1111.21308；macOS 15.8.2 ARM64 远端构建及自动化回归也通过。最低系统声明为 macOS 13.0，但 macOS 13 实机运行仍待验。
 
 ## 本次已生成的开发包
 
-`artifacts/macos-arm64-development-20261115/` 包含 `.app`、DMG、ZIP 和 `verification.json`。已用真实release二进制在临时中文路径验证安装、错误哈希拒绝、升级和回滚。它仍有 `macos-parity.md` 所列功能缺口，尚未经过真实账号或原生透明验收。
+当前包位于 `artifacts/macos-arm64-development-accepted-20261115/`，包含 `.app`、DMG、ZIP 和 `verification.json`，源码提交为 `3f0e92a`。其代码与双平台 CI 通过的 `7c7e219` 相同，后续差异仅为验收文档。
+
+完整 release/UI 构建通过；包签名、ARM64 与最低系统声明、ZIP 解压后的应用、DMG 只读挂载后的应用均验证通过，两个归档中的应用与原包的原生内容指纹一致。新包核心在临时中文目录通过 10 项安装、升级、错误哈希拒绝、运行进程保护和回滚检查。旧目录保留历史证据，不应作为当前开发包入口。
+
+当前账号的一次已授权请求响应和 Finder 普通文件、嵌套目录拖入已通过真实验收；双账号、原生透明、旧 PPT 自动预览等缺口见 `macos-parity.md`。当前优先验收本地开发包，正式签名、公证和在线更新另行完成。
 
 ## 从源码构建
 
@@ -46,6 +50,8 @@ target/release/code-codex mac-rollback --allow-ad-hoc
 
 默认卸载保留产品数据。显式清理选项需要单独确认，并只能作用于本产品拥有的数据及对应凭证；官方客户端和它的账户资料不属于卸载范围。
 
+卸载和登录项操作依据系统用户目录，不能仅靠设置临时 `HOME` 将它们隔离。实际卸载验收需单独安排；不要将安装/回滚临时目录测试扩展成对当前用户数据的卸载测试。当前已用受删除保护的临时应用副本运行真实卸载入口，约 60 秒后返回 `cancelled=true`、`uninstalled=false`，内容指纹与现有进程均未变化。没有手动点击确认或窗口可见性证据，因此不计作手动取消、保留数据卸载或清除数据卸载完成。
+
 ## 只读诊断和隔离测试
 
 ```sh
@@ -63,9 +69,19 @@ python3 scripts/macos/probe-host.py --core target/release/code-codex --report ar
 ```sh
 python3 scripts/macos/manual-session.py \
   --session "$HOME/Library/Application Support/Code-Codex-Mac-Testing/my-new-session" \
-  --core target/release/code-codex
+  --core target/release/code-codex --background
 ```
 
-在该终端输入 `status` 仅返回页面结构计数；用户登录后输入 `attach` 启动文件界面验收，`detach` 结束附加核心，`stop` 或终端中断结束这个测试会话拥有的进程组。测试资料和登录状态保留在新会话目录，便于后续复验；不复用已有 profile。它仍运行于同一个 macOS 用户，系统钥匙串并非独立账户。
+使用独立控制命令查询或管理刚创建的会话，而不是在终端输入裸命令：
+
+```sh
+python3 scripts/macos/manual-session.py \
+  --session "$HOME/Library/Application Support/Code-Codex-Mac-Testing/my-new-session" \
+  --command status
+```
+
+`status` 返回控制器和进程状态；用户登录后用 `--command attach` 启动文件界面验收，`--command detach` 结束附加核心，`--command stop` 结束这个测试会话拥有的进程组。已登录并运行中的验收窗口不需要重复创建。默认使用新 profile；显式续用旧 profile 需要先停止对应会话，并使用 `--reuse-profile-from` 及指定的签名应用副本。测试仍运行于同一个 macOS 用户，系统钥匙串并非独立账户。
+
+Finder 拖入夹具应放在 Documents 下的独立测试目录。宿主会拒绝部分 Library/应用数据目录，不能通过改用另一个文件接口绕过拒绝。
 
 登录后只使用新建的合成对话和工作区。页面观察不读取历史对话文本；私有 host/core 日志不应整体输出。直接打开应用后附加并不能证明启动时的原生账号通道，需另外验证。真实发送任务必须有明确的测试内容。
