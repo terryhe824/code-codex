@@ -194,6 +194,31 @@ fn validate_macos_config(p: &Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn macos_backend_no_proxy(
+    command: &mut tokio::process::Command,
+    upper: Option<&str>,
+    lower: Option<&str>,
+) {
+    // Keep both spellings and their existing precedence. The native backend's
+    // credential-bearing broker requests use localhost, never the system proxy.
+    for (key, value) in [("NO_PROXY", upper.or(lower)), ("no_proxy", lower.or(upper))] {
+        let list = value.unwrap_or_default();
+        let bypass = if list
+            .split(',')
+            .map(str::trim)
+            .any(|host| host == "*" || host.eq_ignore_ascii_case("localhost"))
+        {
+            list.to_owned()
+        } else if list.trim().is_empty() {
+            "localhost".into()
+        } else {
+            format!("{list},localhost")
+        };
+        command.env(key, bypass);
+    }
+}
+
 /// Called before Clap/logging; stdout remains exclusively official JSONL.
 pub(crate) async fn run(raw: std::ffi::OsString) -> Result<u8> {
     let mut p: Value = serde_json::from_str(&raw.to_string_lossy())
@@ -227,6 +252,12 @@ pub(crate) async fn run(raw: std::ffi::OsString) -> Result<u8> {
             "-c",
             "thread_unload_delay_secs=0",
         ]);
+        #[cfg(target_os = "macos")]
+        macos_backend_no_proxy(
+            &mut command,
+            std::env::var("NO_PROXY").ok().as_deref(),
+            std::env::var("no_proxy").ok().as_deref(),
+        );
     }
     command
         .args(args)
@@ -648,6 +679,46 @@ async fn serve(
 #[cfg(all(test, target_os = "macos"))]
 mod macos_broker_tests {
     use super::*;
+
+    #[test]
+    fn native_cli_appends_only_broker_host_to_each_no_proxy_list() {
+        for (upper, lower, expected) in [
+            (None, None, ["localhost", "localhost"]),
+            (Some("upper.example"), None, ["upper.example,localhost"; 2]),
+            (
+                None,
+                Some("internal.example"),
+                ["internal.example,localhost"; 2],
+            ),
+            (
+                Some("upper.example"),
+                Some("lower.example"),
+                ["upper.example,localhost", "lower.example,localhost"],
+            ),
+            (
+                Some(""),
+                Some("lower.example"),
+                ["localhost", "lower.example,localhost"],
+            ),
+            (
+                Some("*"),
+                Some("LOCALHOST,internal.example"),
+                ["*", "LOCALHOST,internal.example"],
+            ),
+        ] {
+            let mut command = tokio::process::Command::new("codex");
+            command.env("HTTPS_PROXY", "http://127.0.0.1:7777");
+            macos_backend_no_proxy(&mut command, upper, lower);
+            let env: HashMap<_, _> = command.as_std().get_envs().collect();
+            for (key, value) in [
+                ("NO_PROXY", expected[0]),
+                ("no_proxy", expected[1]),
+                ("HTTPS_PROXY", "http://127.0.0.1:7777"),
+            ] {
+                assert_eq!(env[std::ffi::OsStr::new(key)].unwrap(), value);
+            }
+        }
+    }
 
     #[test]
     fn native_control_status_satisfies_launch_confirmation() {
