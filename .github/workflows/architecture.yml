@@ -1,8 +1,9 @@
 name: Architecture and contracts
 on:
+  workflow_dispatch:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, 'codex/macos-*']
 permissions:
   contents: read
 jobs:
@@ -13,7 +14,7 @@ jobs:
       - run: cargo test -p cdp-client --locked -- --test-threads=1
   startup-recovery-native:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     env:
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
     steps:
@@ -30,6 +31,8 @@ jobs:
       - name: Build the embedded native launcher (never installs or activates Codex)
         shell: pwsh
         run: ./scripts/build.ps1 -Configuration Release -SkipUi
+      - name: Full Windows workspace regression
+        run: cargo test --release --workspace --locked -- --test-threads=1
       - name: Native recovery protocol and process-identity unit tests
         run: |
           cargo test --release --locked -p code-codex --bin code-codex startup_conflict:: -- --test-threads=1

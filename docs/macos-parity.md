@@ -144,3 +144,10 @@
 - 第一次合成目录放在 `~/Library/Application Support/Code-Codex-Mac-Testing/` 下，宿主提示无法打开文件夹，因为其中含有系统文件；目录没有导入。该目录实际只有 3 个合成文件和 2 个子目录，无符号链接，未读取受保护的用户文件或绕过拒绝。
 - 在普通 Documents 子目录中用相同已知字节重建夹具后，用户按正常授权流程拖入成功，并确认能打开内容。原生提交成功；根文件 24 字节、嵌套文件 26 字节、空文件 0 字节均匹配源 SHA-256，子目录和空目录均存在。收据 `artifacts/macos-port/live-finder-directory-import.json` 保留两次结果。
 - 这一位置对照与 Chromium 对 macOS 应用数据目录及 `~/Library` 子目录的保护规则一致。上游源码是解释依据，未作为本机 Owl 二进制实现的逐行证明。此项无需修改生产导入代码，明确拒绝后的跨接口重试未实现。后续普通目录验收夹具应位于 Documents 的独立子目录，不放在应用数据或系统目录中。[Chromium 目录保护规则](https://chromium.googlesource.com/chromium/src/+/refs/heads/main/chrome/browser/file_system_access/chrome_file_system_access_permission_context.cc#604)
+
+## Continuous regression coverage
+
+- Both workflows now allow manual dispatch and pushes to `codex/macos-*`. The Windows native job runs the complete locked Rust workspace suite after its native build, retaining the existing recovery and UI integration checks. Its timeout is 45 minutes.
+- Mac CI runs all packaging, notarization-state, isolated-session and process-cleanup Python regressions before restoring the temporary CI keychain, then exercises native install/upgrade/rollback against its packaged app. No Apple submission or real-account test is added.
+- Local verification on 2026-11-15: all 38 Python tests passed; all 10 native installation lifecycle checks passed with the current Finder-fixed packaged core. Both workflow files parsed as YAML and passed whitespace validation. This does not certify a remote Actions run.
+- Windows compilation uses Windows C# and resource tools in the existing build script; cross-compiling on this Mac does not replace the native job. The upstream repository is read-only for the connected user. A user-authorized writable repository is needed before pushing this branch and obtaining Windows/Mac runner results.

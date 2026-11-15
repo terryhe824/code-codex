@@ -1,5 +1,6 @@
 name: macOS ARM64
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main, 'codex/macos-*']
@@ -36,6 +37,8 @@ jobs:
           security default-keychain -d user -s "$RUNNER_TEMP/code-codex-tests.keychain-db"
       - name: Rust workspace regression
         run: cargo test --workspace --locked -- --test-threads=1
+      - name: Mac packaging, release and isolated session regression
+        run: python3 -W error::ResourceWarning -m unittest discover -s scripts/macos -p 'test_*.py' -v
       - name: Remove the isolated test keychain
         if: always()
         run: |
@@ -48,12 +51,10 @@ jobs:
           fi
       - name: Shared architecture and file contracts
         run: node --test scripts/test-refactor-contracts.mjs scripts/test-plugin-publication.mjs scripts/test-maintenance-isolation.mjs scripts/test-file-mutation-isolation.mjs scripts/test-macos-file-names.mjs
-      - name: Development package contracts
-        run: python3 scripts/macos/test_package.py
-      - name: Isolated probe process cleanup
-        run: python3 -W error::ResourceWarning scripts/macos/test_probe.py
       - name: Build local development package
         run: python3 scripts/macos/package.py --binary target/debug/code-codex --output artifacts/macos-ci --version "$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "code-codex"))')"
+      - name: Native install, upgrade and rollback acceptance
+        run: python3 scripts/macos/test_lifecycle.py --core target/debug/code-codex --source artifacts/macos-ci/Code-Codex.app
       - uses: actions/upload-artifact@v4
         with:
           name: Code-Codex-macos-arm64-development
