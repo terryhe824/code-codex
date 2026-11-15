@@ -1,4 +1,7 @@
 use super::ProcessGuardError;
+use security_framework::os::macos::code_signing::{
+    Flags, GuestAttributes, SecCode, SecRequirement,
+};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -433,6 +436,7 @@ struct LocalListener {
     fd: i32,
     socket_id: u64,
     generation: u64,
+    shared: bool,
 }
 
 fn listener_at_fd(pid: u32, fd: i32, port: u16) -> io::Result<Option<LocalListener>> {
@@ -471,21 +475,47 @@ fn listener_at_fd(pid: u32, fd: i32, port: u16) -> io::Result<Option<LocalListen
     if !ipv4_loopback {
         return Ok(None);
     }
-    if info.options & libc::SO_REUSEPORT as u16 != 0
-        || info.file_status & PROC_FP_SHARED != 0
-        || info.socket_id == 0
-        || info.generation == 0
+    if info.options & libc::SO_REUSEPORT as u16 != 0 || info.socket_id == 0 || info.generation == 0
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "listener socket is shared or ambiguous",
+            "listener socket is ambiguous",
         ));
     }
     Ok(Some(LocalListener {
         fd,
         socket_id: info.socket_id,
         generation: info.generation,
+        shared: info.file_status & PROC_FP_SHARED != 0,
     }))
+}
+
+fn listener_in_pid(pid: u32, fd_hint: u32, port: u16) -> io::Result<Option<LocalListener>> {
+    let sockets = list_records::<ProcessFd>(fd_hint as usize + 32, |buffer, capacity| unsafe {
+        // libproc returns zero for both an empty list and a failed call.
+        *libc::__error() = 0;
+        let read = libc::proc_pidinfo(pid as i32, libc::PROC_PIDLISTFDS, 0, buffer, capacity);
+        if read == 0 && *libc::__error() != 0 {
+            -1
+        } else {
+            read
+        }
+    })?;
+    let mut found = None;
+    for socket in sockets {
+        if socket.kind != libc::PROX_FDTYPE_SOCKET as u32 {
+            continue;
+        }
+        match listener_at_fd(pid, socket.fd, port) {
+            Ok(Some(listener)) if found.is_none() => found = Some(listener),
+            Ok(Some(_)) => return Err(invalid_data()),
+            Ok(None) => {}
+            // An unrelated descriptor can close between the two snapshots.
+            Err(error) if error.raw_os_error() == Some(libc::EBADF) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(found)
 }
 
 fn listener_in_process(
@@ -494,33 +524,142 @@ fn listener_in_process(
 ) -> Result<Option<LocalListener>, ProcessGuardError> {
     let before = bsd_info(process.pid)
         .map_err(|error| ownership_error("reading listener process", error))?;
-    let sockets =
-        list_records::<ProcessFd>(before.pbi_nfiles as usize + 32, |buffer, capacity| unsafe {
-            libc::proc_pidinfo(
-                process.pid as i32,
-                libc::PROC_PIDLISTFDS,
-                0,
-                buffer,
-                capacity,
-            )
-        })
-        .map_err(|error| ownership_error("listing process file descriptors", error))?;
-    let mut found = None;
-    for socket in sockets {
-        if socket.kind != libc::PROX_FDTYPE_SOCKET as u32 {
-            continue;
-        }
-        match listener_at_fd(process.pid, socket.fd, port) {
-            Ok(Some(listener)) if found.is_none() => found = Some(listener),
-            Ok(Some(_)) => return Err(ProcessGuardError::OwnershipUnknown),
-            Ok(None) => {}
-            // An unrelated descriptor can close between the two snapshots.
-            Err(error) if error.raw_os_error() == Some(libc::EBADF) => {}
-            Err(error) => return Err(ownership_error("reading process socket", error)),
-        }
-    }
+    let found = listener_in_pid(process.pid, before.pbi_nfiles, port)
+        .map_err(|error| ownership_error("reading process socket", error))?;
     process.confirm()?;
     Ok(found)
+}
+
+const CODEX_REQUIREMENT: &str = r#"(identifier "com.openai.codex" or identifier "com.openai.codex.beta") and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "2DC432GLL2""#;
+const CUA_REQUIREMENT: &str = r#"identifier "com.openai.sky.CUAService" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "2DC432GLL2""#;
+
+fn verify_running_signature(
+    process: &ProcessIdentity,
+    requirement: &str,
+) -> Result<(), ProcessGuardError> {
+    process.confirm()?;
+    let verify = || {
+        let requirement: SecRequirement = requirement.parse()?;
+        let mut attributes = GuestAttributes::new();
+        attributes.set_pid(process.pid as libc::pid_t);
+        let code = SecCode::copy_guest_with_attribues(None, &attributes, Flags::NONE)?;
+        code.check_validity(Flags::NO_NETWORK_ACCESS, &requirement)
+    };
+    verify().map_err(|error| {
+        ProcessGuardError::OwnershipMismatch.context("verifying running code signature", error)
+    })?;
+    process.confirm()
+}
+
+fn verified_holder_ancestry(
+    holder: &ProcessIdentity,
+    root: &ProcessIdentity,
+) -> Result<Vec<ProcessIdentity>, ProcessGuardError> {
+    let mut chain = vec![holder.clone()];
+    for _ in 0..=MAX_ANCESTRY_DEPTH {
+        let process = chain.last().ok_or(ProcessGuardError::OwnershipUnknown)?;
+        if process.pid == root.pid {
+            return if process == root {
+                Ok(chain)
+            } else {
+                Err(ProcessGuardError::OwnershipMismatch)
+            };
+        }
+        if !root.executable.contains_helper(&process.executable) {
+            if process.executable.path.file_name() != Some(OsStr::new("SkyComputerUseService"))
+                || process.executable.bundle().and_then(Path::file_name)
+                    != Some(OsStr::new("Codex Computer Use.app"))
+            {
+                return Err(ProcessGuardError::OwnershipMismatch);
+            }
+            verify_running_signature(root, CODEX_REQUIREMENT)?;
+            verify_running_signature(process, CUA_REQUIREMENT)?;
+        }
+        let parent = ProcessIdentity::read(process.parent)
+            .map_err(|error| ownership_error("reading listener holder ancestry", error))?;
+        if parent.uid != root.uid
+            || parent.created_at < root.created_at
+            || parent.created_at > process.created_at
+            || chain.iter().any(|process| process.pid == parent.pid)
+        {
+            return Err(ProcessGuardError::OwnershipMismatch);
+        }
+        chain.push(parent);
+    }
+    Err(ProcessGuardError::OwnershipUnknown)
+}
+
+fn shared_listener_holders(
+    port: u16,
+) -> Result<Vec<(ProcessIdentity, LocalListener)>, ProcessGuardError> {
+    let mut pids = user_pids().map_err(|error| ownership_error("listing listener UIDs", error))?;
+    pids.sort_unstable();
+    pids.dedup();
+    let mut holders = Vec::new();
+    for pid in pids {
+        let before = match bsd_info(pid) {
+            Ok(before) => before,
+            Err(error) if absent(&error) => continue,
+            Err(error) => return Err(ownership_error("reading listener holder PID", error)),
+        };
+        let listener = match listener_in_pid(pid, before.pbi_nfiles, port) {
+            Ok(Some(listener)) => listener,
+            Ok(None) => continue,
+            Err(error) if absent(&error) => continue,
+            Err(error) => {
+                return Err(ownership_error(
+                    "checking for shared listener holders",
+                    error,
+                ));
+            }
+        };
+        let identity = ProcessIdentity::read(pid)
+            .map_err(|error| ownership_error("reading listener holder identity", error))?;
+        if identity.parent != before.pbi_ppid
+            || identity.uid != before.pbi_uid
+            || identity.uid != before.pbi_ruid
+            || process_start(&before).ok() != Some(identity.created_at)
+        {
+            return Err(ProcessGuardError::OwnershipMismatch);
+        }
+        holders.push((identity, listener));
+    }
+    Ok(holders)
+}
+
+fn verify_shared_listener(
+    root: &ProcessIdentity,
+    owner: &ProcessIdentity,
+    listener: LocalListener,
+    port: u16,
+) -> Result<(), ProcessGuardError> {
+    // Darwin exposes only the shared flag, without a fileglob reference
+    // count, and restricts descriptor inspection to the effective UID.
+    // Reject sharing outside the verified tree within that UID.
+    let holders = shared_listener_holders(port)?;
+    if holders.len() < 2
+        || !holders
+            .iter()
+            .any(|(identity, socket)| identity == owner && *socket == listener)
+    {
+        return Err(ProcessGuardError::OwnershipUnknown);
+    }
+    let mut chains = Vec::new();
+    for (holder, socket) in &holders {
+        if !socket.shared
+            || (socket.socket_id, socket.generation) != (listener.socket_id, listener.generation)
+        {
+            return Err(ProcessGuardError::OwnershipMismatch);
+        }
+        chains.extend(verified_holder_ancestry(holder, root)?);
+    }
+    if shared_listener_holders(port)? != holders {
+        return Err(ProcessGuardError::OwnershipMismatch);
+    }
+    for process in chains {
+        process.confirm()?;
+    }
+    root.confirm()
 }
 
 fn verified_listener_for_root(root: &ProcessIdentity, port: u16) -> Result<(), ProcessGuardError> {
@@ -531,6 +670,9 @@ fn verified_listener_for_root(root: &ProcessIdentity, port: u16) -> Result<(), P
     let mut found = None;
     while let Some((process, mut ancestors)) = candidates.pop() {
         if let Some(listener) = listener_in_process(&process, port)? {
+            if listener.shared {
+                return verify_shared_listener(root, &process, listener, port);
+            }
             if found.is_some() {
                 return Err(ProcessGuardError::OwnershipUnknown);
             }

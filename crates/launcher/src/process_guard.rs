@@ -2396,6 +2396,88 @@ mod macos_tests {
         assert!(verify_listener_owner(child.1, std::process::id(), UNIX_EPOCH).is_err());
     }
 
+    fn inherit_listener(
+        descendant: &Path,
+        external_socket: Option<&TcpListener>,
+    ) -> (ListenerChild, SystemTime) {
+        use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
+        let mut command = Command::new("/usr/bin/perl");
+        command.args([
+            "-MIO::Socket::INET", "-MFcntl=F_SETFD", "-e",
+            r#"use strict; use warnings;
+               my ($descendant, $port) = @ARGV;
+               my $socket;
+               if (!$port) {
+                   $socket = IO::Socket::INET->new(LocalAddr => '127.0.0.1',
+                       LocalPort => 0, Proto => 'tcp', Listen => 1) or die $!;
+                   defined fcntl($socket, F_SETFD, 0) or die $!;
+                   $port = $socket->sockport;
+               }
+               my $pid = fork();
+               die $! unless defined $pid;
+               if ($pid) { waitpid($pid, 0); exit 0; }
+               exec {$descendant} $descendant, '-e', '$| = 1; print "$ARGV[0]\n"; <STDIN>;',
+                   $port or die $!;"#,
+        ]).arg(descendant);
+        if let Some(socket) = external_socket {
+            let fd = socket.as_raw_fd();
+            command.arg(socket.local_addr().unwrap().port().to_string());
+            // SAFETY: this executes one async-signal-safe syscall in the child.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let started = SystemTime::now();
+        let mut child = ListenerChild(
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+            0,
+        );
+        let mut line = String::new();
+        BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        child.1 = line.trim().parse().unwrap();
+        (child, started)
+    }
+
+    #[test]
+    fn macos_listener_owner_accepts_a_socket_inherited_across_exec() {
+        let (child, started) = inherit_listener(Path::new("/usr/bin/perl"), None);
+        verify_listener_owner(child.1, child.0.id(), started).unwrap();
+        verify_listener_executable(child.1, Path::new("/usr/bin/perl")).unwrap();
+    }
+
+    #[test]
+    fn macos_shared_listener_rejects_a_same_uid_holder_outside_the_tree() {
+        let foreign = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (child, started) = inherit_listener(Path::new("/usr/bin/perl"), Some(&foreign));
+        assert!(verify_listener_owner(child.1, child.0.id(), started).is_err());
+        drop(foreign);
+        verify_listener_owner(child.1, child.0.id(), started).unwrap();
+    }
+
+    #[test]
+    fn macos_shared_listener_rejects_an_external_cua_lookalike() {
+        let directory = tempfile::tempdir().unwrap();
+        let lookalike = directory
+            .path()
+            .join("Codex Computer Use.app/Contents/MacOS/SkyComputerUseService");
+        std::fs::create_dir_all(lookalike.parent().unwrap()).unwrap();
+        std::fs::copy("/usr/bin/perl", &lookalike).unwrap();
+        let (child, started) = inherit_listener(&lookalike, None);
+        assert!(verify_listener_owner(child.1, child.0.id(), started).is_err());
+    }
+
     #[test]
     fn macos_running_check_uses_the_exact_image() {
         assert!(is_executable_running(&env::current_exe().unwrap()).unwrap());
