@@ -14,6 +14,23 @@ import tempfile
 
 REPO = Path(__file__).resolve().parents[2]
 BUNDLE_ID = 'io.github.rice-dog.code-codex.macos'
+PRODUCT = 'Code-Codex'
+MIN_MACOS = '13.0'
+STORAGE_LAYOUT_NAME = 'storage-layout.json'
+STORAGE_LAYOUT_CONTENT = (json.dumps({'schema': 1, 'product': PRODUCT})+'\n').encode('utf-8')
+RESOURCE_FILES = ('LICENSE', 'THIRD_PARTY_NOTICES_EN.md', 'THIRD_PARTY_NOTICES_ZH_CN.md',
+                  'THIRD_PARTY_LICENSES.txt')
+
+
+def rename_exclusive(source, destination):
+    # Darwin RENAME_EXCL makes the absence check atomic with publication.
+    libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    rename = libc.renamex_np
+    rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(os.fsencode(source), os.fsencode(destination), 0x00000004) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(destination))
 
 
 def create_bundle(binary, destination, version, launcher=None):
@@ -46,29 +63,19 @@ def create_bundle(binary, destination, version, launcher=None):
         shutil.copyfile(binary, core)
         core.chmod(0o755)
         subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(core)], check=True, capture_output=True)
-        for name in ('LICENSE', 'THIRD_PARTY_NOTICES_EN.md', 'THIRD_PARTY_NOTICES_ZH_CN.md', 'THIRD_PARTY_LICENSES.txt'):
+        for name in RESOURCE_FILES:
             shutil.copyfile(REPO/name, resources/name)
-        (resources/'storage-layout.json').write_text(json.dumps({'schema': 1, 'product': 'Code-Codex'})+'\n')
+        (resources/STORAGE_LAYOUT_NAME).write_bytes(STORAGE_LAYOUT_CONTENT)
         info = {'CFBundleIdentifier': BUNDLE_ID, 'CFBundleName': 'Code-Codex',
                 'CFBundleDisplayName': 'Code-Codex', 'CFBundleExecutable': 'Code-Codex',
                 'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': version,
-                'CFBundleVersion': version, 'LSMinimumSystemVersion': '13.0',
+                'CFBundleVersion': version, 'LSMinimumSystemVersion': MIN_MACOS,
                 'NSHighResolutionCapable': True}
         (bundle/'Contents/Info.plist').write_bytes(plistlib.dumps(info))
         # Local development signature only. Public release needs Developer ID + notarization.
         subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(bundle)], check=True, capture_output=True)
         subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(bundle)], check=True, capture_output=True)
-        # No replace: do not overwrite a pre-existing destination, including a dangling symlink.
-        if os.path.lexists(destination):
-            raise FileExistsError(destination)
-        # Darwin RENAME_EXCL makes the absence check atomic with publication.
-        libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
-        rename = libc.renamex_np
-        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-        rename.restype = ctypes.c_int
-        if rename(os.fsencode(bundle), os.fsencode(destination), 0x00000004) != 0:
-            error = ctypes.get_errno()
-            raise OSError(error, os.strerror(error), str(destination))
+        rename_exclusive(bundle, destination)
     return destination
 
 
