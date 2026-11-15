@@ -32,37 +32,39 @@ class OwnedGroup:
     def pid(self):
         return self._child.pid
 
-    def exited(self):
+    def exited(self, timeout=0):
         if not self._exited:
-            self._exited = bool(self._events.control(None, 1, 0))
+            self._exited = bool(self._events.control(None, 1, timeout))
         return self._exited
 
-    def close(self):
+    def _signal_group(self, group, sig):
+        try:
+            os.killpg(group, sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # Darwin can return EPERM for a group containing only the
+            # waitable group leader. Its PID is still reserved.
+            if not self.exited():
+                raise
+            return False
+
+    def close(self, *, initial_signal=signal.SIGTERM, grace=1):
         try:
             child = self._child
             if child is None or child.returncode is not None:
-                return
+                return None if child is None else child.returncode
             group = child.pid
             if group <= 1 or group == os.getpgrp():
                 raise RuntimeError("refusing to signal a process group without owned identity")
             # Use group existence, never leader liveness. Do not poll/wait
             # or otherwise reap the leader until the final group signal.
-            try:
-                os.killpg(group, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            else:
-                deadline = time.monotonic() + 1
-                while time.monotonic() < deadline:
-                    try:
-                        os.killpg(group, 0)
-                    except ProcessLookupError:
-                        break
+            if self._signal_group(group, initial_signal):
+                deadline = time.monotonic() + grace
+                while time.monotonic() < deadline and self._signal_group(group, 0):
                     time.sleep(0.05)
-                try:
-                    os.killpg(group, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                self._signal_group(group, signal.SIGKILL)
             return child.wait(timeout=3)
         finally:
             self._events.close()

@@ -69,7 +69,7 @@ with tempfile.TemporaryDirectory(prefix='code-codex-mac-probe-',dir='/private/tm
  finally:
   try:
    if supervisor is not None:
-    result['supervisorExitCode']=supervisor.close()
+    result['supervisorExitCode']=supervisor.close(initial_signal=signal.SIGINT, grace=3)
   finally:
    exit_code=p.close()
    if result.get('stillRunningAtEnd') is False:

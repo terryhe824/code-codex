@@ -28,7 +28,7 @@ signal.signal(signal.SIGTERM, signal.SIG_IGN)
 signal.signal(signal.SIGINT, signal.SIG_IGN)
 with open(pid_file, 'w') as out:
     out.write(str(os.getpid()))
-time.sleep(3.3)
+time.sleep(5.3)
 with open(marker, 'w') as out:
     out.write('survived')
 """
@@ -112,7 +112,7 @@ class ProbeCleanup(unittest.TestCase):
                 self.assertEqual(set(indicators), {"host", "supervisor"} if report_failure else {"host"})
                 for role, (pid_file, marker) in indicators.items():
                     pid = int(pid_file.read_text())
-                    until = time.monotonic() + 4
+                    until = time.monotonic() + 6
                     while time.monotonic() < until and not marker.exists():
                         try:
                             os.kill(pid, 0)
