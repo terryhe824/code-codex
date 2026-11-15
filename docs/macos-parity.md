@@ -2,7 +2,7 @@
 
 目标：完整复刻 Windows 基线 `03454a8`，不是核心功能演示。
 
-当前状态：已有 ARM64 本地开发包；已完成用户手动登录后的真实窗口文件与插件主要路径验收。完整 Windows 功能对齐仍未完成，真实多账号消息链路、原生透明、旧版 PPT、正式分发及跨平台回归仍有缺口。
+当前状态：已有 ARM64 本地开发包；已完成用户手动登录后的真实窗口文件与插件主要路径验收。同一源码提交的 Windows/Mac 配置内自动化回归均已通过。完整 Windows 功能对齐仍未完成，真实多账号消息链路、原生透明、旧版 PPT 自动预览、正式分发及真实系统验收仍有缺口。
 
 ## 继续补齐与用户复验（2026-11-15）
 
@@ -12,7 +12,7 @@
 - 卸载失败恢复修复提交 `06799a8`。程序先暂存当前应用包及存在的上一版本，再撤销启动项和按需清除数据。不可变包导致暂存移动失败时，凭证尚未删除。暂存、撤销启动项或清除数据阶段失败时，程序尝试恢复已暂存的包，原位冲突时保留并报告副本。最终删除暂存目录在此恢复范围之外，已成功撤销的启动项和已删除的凭证与数据不会恢复。安装模块 11 项定向测试及独立复核通过，包含安装、回滚和卸载。完整 Rust 工作区 797 通过、0 失败、15 显式忽略。
 - 原生透明补充排查：官方宿主确有原生“半透明侧边栏”设置，但它是持久、配置级的 macOS vibrancy，受失焦和大窗口强制不透明策略影响。未找到单窗口清透背景及崩溃后精确恢复接口，不能将此设置计为 Windows 透明插件等价通过。
 - PowerPoint 在只读会话中能打开两页 PPTX；可写 `0600` 文件对照仍无法导出，保存命令无 PNG 产物，宏保护合同也未确认。用户明确允许改用 WPS。WPS 12.1.25895 已通过本地界面将旧版 PPT 导出为两张不同的 3840×2880 PNG，OCR 确认页序与内容，源文件哈希未变。收据位于 `artifacts/macos-port/office-probe/wps-legacy-ppt/receipt.json`。自动预览适配尚未通过：没有已验证的本地导出接口，AX 未提供文档完整路径，独立 PID 也未证明可隔离现有 WPS 配置，不能将手动导出等同于安全自动化。手动可用路径为 WPS「文件 → 输出为图片 → 逐页输出 → 所有页 → PNG」。
-- 本机 Developer ID Application 身份数为 0，正式公证尚未执行。Windows 工具链和该分支的 Windows CI 运行均不可用，不能以本机回归代替。
+- 本机 Developer ID Application 身份数为 0，正式公证尚未执行。经用户授权已创建公开 fork 并运行 Windows/Mac CI；远端结果见文末，不能以本机回归代替 Windows 验证。
 
 ## 登录后真实窗口验收（2026-11-15）
 
@@ -62,7 +62,7 @@
 | 旧版 PPT 原生导出 | WPS 手动导出通过；自动预览未通过 | 两页 PNG 的页序/内容和源文件不变已核对；自动化文档身份与进程隔离仍需解决 |
 | 安装/更新/登录启动/卸载 | 本地实现、安装模块 11 项定向测试及打包核心 10 项安装生命周期检查通过 | 包含不可变包拒绝、可逆的暂存恢复和运行进程保护；真实 GUI 卸载及注销后重新登录待验；在线 Mac 更新源待配置 |
 | 正式签名/公证/发布 | 制品准备脚本已交付，正式分发待完成 | 需要 Developer ID、公证和独立发布通道，以及经批准的原生发布者信任和正式签名包生命周期验收 |
-| Windows 回归 | 未验证 | 本机不是 Windows runner |
+| Windows 回归 | 配置内远端自动化检查通过 | Windows Server 2025：886 项 Rust 通过、29 项显式忽略；协议、界面、恢复及窗口检查通过；官方 AppX 安装环境验收仍待完成，详见文末 |
 
 ## 插件逐项记录
 
@@ -107,10 +107,11 @@
 - G2：登录后正式注入、文件交互和插件主要路径已通过；全部参数组合、冷重启与性能长期运行尚未完整验收。
 - G3：官方签名应用提供配置级侧边栏 vibrancy，但尚无满足单窗口清透、恢复及故障退出合同的接口；CSS 透明与实际 NSWindow 透明分别记录。
 - G4：真实官方资格/身份读取、随启动安装的桥接、当前账号一次请求响应已通过；真实多账号切换、模型/额度、发送取消及上下文延续仍未完整完成。零回合新会话没有落盘归档，不能用它假定 native.prepare 已通过。
-- 旧 `.ppt` 的 WPS 手动导出已通过，自动预览仍未通过。Finder 显示文件、普通文件和普通用户目录拖入通过；受保护目录仍按宿主规则拒绝。实际卸载对话框及注销后登录项行为、Windows runner、Developer ID、公证、正式签名包生命周期及 Mac 更新源均待完整验收。
+- 旧 `.ppt` 的 WPS 手动导出已通过，自动预览仍未通过。Finder 显示文件、普通文件和普通用户目录拖入通过；受保护目录仍按宿主规则拒绝。实际 Mac 卸载对话框及注销后登录项行为、已安装官方 AppX 的 Windows 宿主、Developer ID、公证、正式签名包生命周期及 Mac 更新源均待完整验收。
 - ASCII 异常后的自动清理，以及切回官方身份后 legacy account 的共享回合终态轮询，各保留一项失败；相应生产文件与 Windows 固定基线一致，未修改锁定发布插件来隐藏这些缺陷。
 - 后台进程清理覆盖本产品启动的继承进程组；主动另建 session/group 的后代不受该机制约束，不能称为 Windows Job Object 的完全等价隔离。
-- 本地 API 代理绕过属于共享实现，也改善 Windows 路径；Windows 原有就绪探测仍保留，实际 Windows 回归尚未运行。
+- Windows 预览版本号沿用基线的文件身份、长度和时间戳方案。同一文件被等长原地改写且元数据未变化时，不能保证发现内容变化；远端一次快速改写已暴露这一边界。版本转换测试改为显式推进时间戳以验证拒绝过期版本，没有宣称解决该基线限制。替换文件且保留时间戳的身份校验另有测试覆盖。
+- 本地 API 代理绕过属于共享实现，也改善 Windows 路径；Windows 原有就绪探测仍保留，配置内 Windows 自动化回归已在公开 fork 通过。
 
 ## 消息链路修复后的构建与开发产物
 
@@ -150,4 +151,12 @@
 - Both workflows now allow manual dispatch and pushes to `codex/macos-*`. The Windows native job runs the complete locked Rust workspace suite after its native build, retaining the existing recovery and UI integration checks. Its timeout is 45 minutes.
 - Mac CI runs all packaging, notarization-state, isolated-session and process-cleanup Python regressions before restoring the temporary CI keychain, then exercises native install/upgrade/rollback against its packaged app. No Apple submission or real-account test is added.
 - Local verification on 2026-11-15: all 38 Python tests passed; all 10 native installation lifecycle checks passed with the current Finder-fixed packaged core. Both workflow files parsed as YAML and passed whitespace validation. This does not certify a remote Actions run.
-- Windows compilation uses Windows C# and resource tools in the existing build script; cross-compiling on this Mac does not replace the native job. The upstream repository is read-only for the connected user. A user-authorized writable repository is needed before pushing this branch and obtaining Windows/Mac runner results.
+- Windows compilation uses Windows C# and resource tools in the existing build script; cross-compiling on this Mac does not replace the native job. With explicit user authorization, the branch is now pushed to the public fork [terryhe824/code-codex](https://github.com/terryhe824/code-codex/tree/codex/macos-full-parity).
+- First remote Mac run at `a570e35` [passed](https://github.com/terryhe824/code-codex/actions/runs/43712551636): 797 Rust tests (15 explicitly ignored), 38 Python tests, 70 shared Node contracts and 10 native lifecycle checks. The ARM64 development app, ZIP and DMG were uploaded by CI; these remain ad-hoc signed and not notarized.
+- First Windows contracts run failed while Chrome held a write lock on `DevToolsActivePort`. Commit `7c368c3` waits for a readable, complete and valid port within the existing startup deadline, with three focused regression tests. Local verification passed all 73 Node contracts and 172 browser surface checks. Its [Windows run](https://github.com/terryhe824/code-codex/actions/runs/43713047250) passed protocol and contracts jobs; the superseded native job was cancelled after reproducing the known path assertions. Its [Mac run](https://github.com/terryhe824/code-codex/actions/runs/43713046695) passed completely.
+- The initial native Windows suite exposed three assertions comparing equivalent paths with different spellings: the runner's 8.3 temporary-directory alias versus its canonical name, and a standard-library verbatim prefix versus the normalized shell path. Commit `d629772` compares canonical targets while retaining absolute-path, leaf-label, stale-context and invalid-reveal checks. All 55 local bridge tests passed. The full Windows workspace invocation now collects all crate results with `--no-fail-fast`.
+- The same commit's [Mac CI](https://github.com/terryhe824/code-codex/actions/runs/43713756766) passed on macOS 15.8.2 ARM64: 797 Rust tests (15 ignored), 38 Python tests, 73 shared Node contracts and 10 native lifecycle checks. Development artifacts were uploaded. This adds macOS 15 runner evidence, not macOS 13 runtime acceptance. Its [Windows CI](https://github.com/terryhe824/code-codex/actions/runs/43713756837) passed all 534 launcher-core tests, including the three corrected path assertions, but exposed further shortcut-fixture and media-version-timing failures in other targets.
+- Commit `2442f2e` canonicalizes the native Unicode shortcut fixture and supplies synthetic icon PNGs through the existing test shell interface. Real COM shortcut inspection, creation and native atomic replacement remain in use; installed official AppX discovery/icon extraction are outside those transaction tests. The model-resource version-transition fixture explicitly advances mtime, making its intended metadata-version change deterministic. No production behavior or ignore list changed in that commit. Local verification: one targeted model-resource test and 46 portable shortcut tests passed. [Mac CI](https://github.com/terryhe824/code-codex/actions/runs/43715105137) passed completely. [Windows CI](https://github.com/terryhe824/code-codex/actions/runs/43715105079) passed the native transaction and model-resource checks; its sole remaining workspace failure was Shell parsing of an uninstalled official AppX target (HRESULT `0x80070002`).
+- Commit `7c7e219` separates the installed-package Shell target check from the ordinary Unicode link round-trip. The latter and malformed-file checks remain enabled in CI. `installed_codex_packaged_target_roundtrip` is explicitly ignored by default because it requires the official Codex AppX package on a provisioned Windows host; its original assertions remain intact. This is a pending real-installation acceptance item, not a passing fixture result. On such a host, run `cargo test --release --locked -p code-codex --bin code-codex-shortcut native_shortcut::tests::installed_codex_packaged_target_roundtrip -- --ignored --exact`.
+- Final verified source: `7c7e219826f6e465c1855887d2ba79e39a7e41b7`. [Windows CI passed](https://github.com/terryhe824/code-codex/actions/runs/43716529965) on Windows Server 2025 x64: complete Rust workspace 886 passed, 0 failed, 29 explicitly ignored; all three jobs passed. Additional native recovery checks passed: 90 conflict checks, real compiled transport/reset, 55 diagnostic-window checks in each of English and Chinese, 55 compiled launcher checks, and 59 native window recovery checks. Protocol, UI contracts and account handoff fixtures also passed. No real Codex process was installed, activated or closed.
+- [Mac CI passed at the same source](https://github.com/terryhe824/code-codex/actions/runs/43716530046) on macOS 15.8.2 ARM64: 797 Rust passed, 0 failed, 15 explicitly ignored; 38 Python tests, 73 shared Node contracts and 10 native installation lifecycle checks passed. CI uploaded the ad-hoc development app, ZIP and DMG. Full logs and the local history receipt are retained under `artifacts/macos-port/`. These successful configured workflows do not close the real-account, installed-AppX, macOS 13, native transparency, automatic legacy-PPT or production-signing gaps above.
