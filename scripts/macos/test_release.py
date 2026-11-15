@@ -242,7 +242,7 @@ class ReleaseTests(unittest.TestCase):
     def receipt(self):
         return json.loads((self.work/'notarization.json').read_text())
 
-    def test_pending_rejected_and_accepted_are_distinct_from_release_ready(self):
+    def test_verified_notarized_artifacts_still_record_blocked_distribution(self):
         self.prepare()
         self.assertEqual(self.notarize('submit'), 0)
         self.assertEqual(self.receipt()['submission_id'], JOB)
@@ -257,7 +257,11 @@ class ReleaseTests(unittest.TestCase):
         self.stapler_fails = False
         self.assertEqual(self.notarize('finish'), 0)
         published = json.loads((self.release/'release.json').read_text())
-        self.assertEqual(published['status'], 'release-ready')
+        self.assertEqual(published['status'], 'notarized-artifacts')
+        self.assertEqual(published['distribution_readiness'], {
+            'status': 'blocked',
+            'reason': 'unconfigured-native-release-trust',
+        })
         self.assertEqual(published['submission_id'], JOB)
         for suffix in ('.zip', '.dmg'):
             asset = self.release/(self.candidate.stem+suffix)

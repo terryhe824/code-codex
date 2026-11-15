@@ -372,11 +372,14 @@ def publish(work, receipt, app, dmg, log):
         assets = {asset.name: asset_details(asset) for asset in (final_dmg, final_zip)}
         (dist/'SHA256SUMS').write_text(''.join(f'{detail["sha256"]}  {name}\n' for name, detail in assets.items()))
         (dist/'apple-notarization.json').write_text(json.dumps(log, indent=2, sort_keys=True)+'\n')
-        release = {**receipt, 'status': 'release-ready', 'assets': assets,
-                   'standalone_app': {'name': APP, 'stapled': True}}
+        release = {**receipt, 'status': 'notarized-artifacts', 'assets': assets,
+                   'standalone_app': {'name': APP, 'stapled': True},
+                   'distribution_readiness': {'status': 'blocked',
+                                              'reason': 'unconfigured-native-release-trust'}}
         (dist/'release.json').write_text(json.dumps(release, indent=2, sort_keys=True)+'\n')
         rename_exclusive(dist, destination)
-    print(f'Verified release artifacts at {destination}.')
+    print(f'Verified notarized artifacts at {destination}. '
+          'Public distribution is blocked pending native release trust.')
 
 
 def finish(work, receipt, profile, recovery_id):
